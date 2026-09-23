@@ -1,0 +1,5 @@
+# FocusGuard dependencies — pin known-good versions
+
+numpy>=1.24,<2.0
+opencv-contrib-python>=4.9,<5.0
+matplotlib>=3.8,<4.0
