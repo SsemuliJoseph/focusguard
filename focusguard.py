@@ -4,117 +4,93 @@ FocusGuard — Live Classical Computer Vision Demo
 ================================================
 
 A real-time webcam demo that makes classical CV mathematics visible at
-the pixel level. Two windows:
+the pixel level. Two windows open side by side:
 
-  * FocusGuard  — the mood/focus detector (the product)
-  * Math Panel  — the exact arithmetic the detector is running (the glass box)
+  * FocusGuard  — the mood/focus detector (product)
+  * Math Panel  — the arithmetic the detector is running (glass box)
 
-The pedagogical point: every equation in the lecture slides is shown as
-actual arithmetic on actual pixels, at 30 fps.
-
-Usage
------
-    python focusguard.py
+Designed for classroom projection: 22px+ body text, 28px+ cell values,
+color-coded panels, on-screen legend.
 
 Controls
 --------
-    1 / 2 / 3 / 4   Switch math panel (Kernel / Morphology / Otsu / Hough)
-    k               Cycle kernel
-    m               Cycle structuring element
-    o               Toggle dilate <-> erode
-    l               Toggle LAB mode <-> DEMO mode
-    s               Toggle liveness detection
-    q               Quit (runs session report)
+    1/2/3/4   Switch math panel (Kernel / Morphology / Otsu / Hough)
+    k         Cycle kernel
+    m         Cycle structuring element
+    o         Toggle dilate <-> erode
+    l         Toggle LAB <-> DEMO
+    s         Toggle liveness
+    q         Quit (runs session report)
 
 Requires: opencv-contrib-python, numpy, matplotlib
 """
 
-# ============================================================================
-# SECTION 1 — IMPORTS
-# ============================================================================
-# Critical: matplotlib MUST be set to Agg before pyplot is imported, otherwise
-# VS Code's inline renderer fights cv2.imshow for the event loop and the
-# math panels go blank.
-# ----------------------------------------------------------------------------
-import os
-import sys
-import time
-import collections
+#!/usr/bin/env python3
+"""
+FocusGuard — Live Classical Computer Vision Demo
 
+Two windows side by side:
+  * FocusGuard  — mood/focus detector (readable by non-experts)
+  * Math Panel  — the arithmetic it runs (glass box)
+
+Controls: 1/2/3/4 panel | k kernel | m SE | o dil/ero | l LAB/DEMO | s live | q quit
+"""
+
+import os, time, shutil, subprocess, collections
 import cv2
 import numpy as np
 
 import matplotlib
-matplotlib.use("Agg")           # MUST be before `import matplotlib.pyplot`
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
 
 # ============================================================================
-# SECTION 2 — CONSTANTS, STATE, KERNELS, STRUCTURING ELEMENTS
+# CONSTANTS
 # ============================================================================
-# All the tunable bits live here so the demo can be adjusted without
-# hunting through the functions.
-# ----------------------------------------------------------------------------
-
 WINDOW_MAIN = "FocusGuard"
 WINDOW_MATH = "Math Panel"
-MATH_W, MATH_H = 1400, 420        # math panel canvas size (wide, short)
-CAM_INDEX = 0                     # /dev/video0
-WORK_W, WORK_H = 480, 360         # all CV work happens at this size
-DETECT_EVERY = 3                  # run the DNN face detector every N frames
-MATH_REDRAW_EVERY = 6             # redraw matplotlib panels every N frames
 
-# Colors (BGR — OpenCV convention, NOT RGB)
-C_BG        = (18, 18, 24)        # dark slate
-C_PANEL     = (32, 32, 42)        # panel fill
-C_BORDER    = (80, 80, 100)       # panel border
-C_TITLE     = (200, 200, 220)     # title text
-C_TEXT      = (230, 230, 240)     # body text
-C_ACCENT    = (255, 200, 80)      # sky-blue accent (BGR: high B)
-C_POS       = (80, 220, 80)       # green — positive
-C_NEG       = (80, 80, 240)       # red — negative
-C_ZERO      = (140, 140, 140)     # gray — zero
-C_GREEN     = (0, 200, 0)
-C_RED       = (0, 0, 240)
-C_YELLOW    = (0, 220, 220)
+CAM_INDEX = 0
+WORK_W, WORK_H = 480, 360
+DETECT_EVERY = 5
+MATH_REDRAW_EVERY = 8
 
-FONT = cv2.FONT_HERSHEY_SIMPLEX
+# Colors (BGR)
+C_BG       = (24, 20, 18)
+C_PANEL    = (36, 32, 30)
+C_PANEL_HI = (56, 48, 44)
+C_BORDER   = (110, 90, 90)
+C_TEXT     = (240, 232, 232)
+C_MUTED    = (168, 148, 148)
+C_POS      = (160, 255, 125)
+C_NEG      = (107, 107, 255)
+C_ZERO     = (140, 140, 140)
+C_AMBER    = (102, 209, 255)
+C_PURPLE   = (255, 125, 199)
+C_BLUE     = (222, 168, 78)
+C_GREEN    = (160, 255, 125)
+C_RED      = (107, 107, 255)
+C_YELLOW   = (0, 220, 220)
+C_DIM      = (70, 70, 90)
 
-# --- Kernel library (Section 5 uses these) ----------------------------------
-# Each kernel is a small matrix that we slide over the image. The kernel is
-# applied via elementwise multiply-and-sum (convolution / correlation).
+F_TITLE = cv2.FONT_HERSHEY_TRIPLEX
+F_BODY  = cv2.FONT_HERSHEY_SIMPLEX
+
 KERNELS = {
-    "sobel_x":   np.array([[-1, 0, 1],
-                           [-2, 0, 2],
-                           [-1, 0, 1]], dtype=np.float32),
-    "sobel_y":   np.array([[-1, -2, -1],
-                           [ 0,  0,  0],
-                           [ 1,  2,  1]], dtype=np.float32),
-    "prewitt_x": np.array([[-1, 0, 1],
-                           [-1, 0, 1],
-                           [-1, 0, 1]], dtype=np.float32),
-    "prewitt_y": np.array([[-1, -1, -1],
-                           [ 0,  0,  0],
-                           [ 1,  1,  1]], dtype=np.float32),
-    "roberts_x": np.array([[ 1, 0],
-                           [ 0,-1]], dtype=np.float32),  # 2x2
-    "roberts_y": np.array([[ 0, 1],
-                           [-1, 0]], dtype=np.float32),
-    "laplacian": np.array([[ 0,  1,  0],
-                           [ 1, -4,  1],
-                           [ 0,  1,  0]], dtype=np.float32),
-    "gaussian":  np.array([[1, 2, 1],
-                           [2, 4, 2],
-                           [1, 2, 1]], dtype=np.float32) / 16.0,
+    "sobel_x":   np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32),
+    "sobel_y":   np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32),
+    "prewitt_x": np.array([[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]], dtype=np.float32),
+    "prewitt_y": np.array([[-1, -1, -1], [0, 0, 0], [1, 1, 1]], dtype=np.float32),
+    "roberts_x": np.array([[1, 0], [0, -1]], dtype=np.float32),
+    "roberts_y": np.array([[0, 1], [-1, 0]], dtype=np.float32),
+    "laplacian": np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32),
+    "gaussian":  np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=np.float32) / 16.0,
     "box_blur":  np.ones((3, 3), dtype=np.float32) / 9.0,
 }
 KERNEL_ORDER = list(KERNELS.keys())
 
-# --- Structuring elements (Section 6 uses these) ----------------------------
-# An SE is a binary footprint. Morphology looks at exactly the pixels under
-# the 1s of this footprint and ignores the rest. Shape matters: a disc SE
-# is rotationally invariant, a cross SE preserves connectivity, etc.
 SE_KERNELS = {
     "square_3":  cv2.getStructuringElement(cv2.MORPH_RECT,    (3, 3)),
     "cross_3":   cv2.getStructuringElement(cv2.MORPH_CROSS,   (3, 3)),
@@ -126,474 +102,335 @@ SE_KERNELS = {
 SE_ORDER = list(SE_KERNELS.keys())
 MORPH_OPS = ["dilate", "erode"]
 
-# --- Global UI state (mutated by the mouse and keyboard callbacks) ----------
+# AU presentation metadata — friendly name, technical name, hint
+AU_INFO = [
+    # (short_label, plain_name, technical_name, hint_low, hint_high)
+    ("Smile",       "Lip corner puller", "AU12", "flat mouth",     "smiling"),
+    ("Cheek raise", "Cheek raiser",      "AU6",  "relaxed cheeks", "genuine smile"),
+    ("Brow furrow", "Brow lowerer",      "AU4",  "relaxed brow",   "frowning / focused"),
+    ("Brow raise",  "Inner brow raiser", "AU1",  "relaxed brow",   "surprised / worried"),
+    ("Mouth open",  "Lips part",         "AU25", "closed mouth",   "talking / surprised"),
+]
+
 STATE = {
-    "mouse":         (MATH_W // 2, MATH_H // 2),  # (x, y) in FocusGuard window
-    "panel":         "kernel",     # kernel | morph | otsu | hough
-    "kernel_idx":    0,
-    "se_idx":        0,
-    "op_idx":        0,
-    "mode":          "LAB",        # LAB | DEMO
+    "mouse": (0, 0),
+    "mouse_small_x": 0, "mouse_small_y": 0,
+    "panel": "kernel",
+    "kernel_idx": 0, "se_idx": 0, "op_idx": 0,
+    "mode": "LAB",
     "show_liveness": True,
-    "frame_count":   0,
-    # Cached matplotlib render for Otsu and Hough (blitted into cv2 windows)
-    "otsu_cache":    None,
-    "hough_cache":   None,
-    # Session tracking (used by the report cell)
-    "focus_log":     [],           # list of (t_sec, focus_score)
-    "start_time":    None,
-    "blink_times":   collections.deque(maxlen=600),
-    "mood_kf":       None,         # initialized lazily
-    "prev_gray":     None,         # for optical flow
-    "prev_pts":      None,
-    "dnn_net":       None,         # lazily loaded face detector
-    "haar":          None,
-    "face_box":      None,         # cached face box between detect frames
-    "dnn_tried":     False,
+    "frame_count": 0,
+    "otsu_cache": None, "hough_cache": None,
+    "math_cache": None, "math_sig": None,
+    "focus_log": [],
+    "start_time": None,
+    "blink_times": collections.deque(maxlen=600),
+    "mood_kf": None,
+    "prev_gray": None, "prev_pts": None,
+    "face_box": None,
 }
 
 
 # ============================================================================
-# SECTION 3 — SMALL DRAWING UTILITIES
+# DRAW UTILITIES
 # ============================================================================
-# Everything here is cv2 drawing. We avoid matplotlib for the per-frame
-# panels because rendering a figure every frame kills fps. Panels 1 and 2
-# are drawn entirely with cv2.line / cv2.rectangle / cv2.putText.
-# ----------------------------------------------------------------------------
-
 def blank_canvas(w, h, bg=C_BG):
-    """Return a BGR canvas of the given size filled with a dark background."""
-    canvas = np.zeros((h, w, 3), dtype=np.uint8)
-    canvas[:] = bg
-    return canvas
+    c = np.zeros((h, w, 3), dtype=np.uint8); c[:] = bg; return c
 
 
-def draw_title(canvas, text, x, y, color=C_TITLE, scale=0.55, thickness=1):
-    """Draw a small heading with a subtle underline."""
-    cv2.putText(canvas, text, (x, y), FONT, scale, color, thickness, cv2.LINE_AA)
-    (tw, _), _ = cv2.getTextSize(text, FONT, scale, thickness)
-    cv2.line(canvas, (x, y + 4), (x + tw, y + 4), color, 1, cv2.LINE_AA)
+def draw_badge(canvas, x, y, num, radius=22, active=True):
+    bg_col = C_AMBER if active else (70, 60, 55)
+    cv2.circle(canvas, (x, y), radius, bg_col, -1, cv2.LINE_AA)
+    cv2.circle(canvas, (x, y), radius, C_TEXT, 2, cv2.LINE_AA)
+    txt = str(num)
+    (tw, th), _ = cv2.getTextSize(txt, F_BODY, 1.0, 2)
+    cv2.putText(canvas, txt, (x - tw // 2, y + th // 2),
+                F_BODY, 1.0, (20, 20, 20), 2, cv2.LINE_AA)
 
 
-def draw_centered_text(canvas, text, cx, cy, color=C_TEXT,
-                       scale=0.5, thickness=1):
-    """Draw text horizontally centered on cx, vertically on cy."""
-    (tw, th), _ = cv2.getTextSize(text, FONT, scale, thickness)
+def draw_centered(canvas, text, cx, cy, color=C_TEXT, scale=0.7,
+                  font=F_BODY, thickness=1):
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
     cv2.putText(canvas, text, (cx - tw // 2, cy + th // 2),
-                FONT, scale, color, thickness, cv2.LINE_AA)
+                font, scale, color, thickness, cv2.LINE_AA)
 
 
-def draw_number_grid(canvas, values, x0, y0, cell_w, cell_h,
-                     text_color_fn=None, border_color=C_BORDER):
-    """
-    Draw a 2D array of numbers as a grid of cells.
-
-    values          : 2D numpy array of numbers (int or float)
-    x0, y0          : top-left of the grid on the canvas
-    cell_w, cell_h  : pixel size of each cell
-    text_color_fn   : optional callable(value) -> BGR color for the text
-    """
+def draw_number_grid(canvas, values, x0, y0, cw, ch,
+                     text_color_fn=None, border_color=C_BORDER,
+                     bg_fn=None, strike_fn=None, text_scale=0.85):
     rows, cols = values.shape
     for r in range(rows):
         for c in range(cols):
-            cx0 = x0 + c * cell_w
-            cy0 = y0 + r * cell_h
-            cx1 = cx0 + cell_w
-            cy1 = cy0 + cell_h
-            # Cell background
-            cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), C_PANEL, -1)
-            cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), border_color, 1)
-            # Text
+            cx0, cy0 = x0 + c * cw, y0 + r * ch
+            cx1, cy1 = cx0 + cw, cy0 + ch
+            bg = bg_fn(r, c) if bg_fn else C_PANEL
+            cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), bg, -1)
+            cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), border_color, 2)
+            if strike_fn and strike_fn(r, c):
+                cv2.line(canvas, (cx0 + 5, cy0 + 5), (cx1 - 5, cy1 - 5),
+                         C_ZERO, 2, cv2.LINE_AA)
             v = values[r, c]
-            if isinstance(v, (float, np.floating)):
-                txt = f"{v:.2f}".rstrip("0").rstrip(".") if abs(v) < 100 else f"{v:.0f}"
+            if isinstance(v, (float, np.floating)) and v != int(v):
+                txt = f"{v:.2f}".rstrip("0").rstrip(".")
             else:
-                txt = f"{int(v)}"
+                txt = str(int(v))
             color = text_color_fn(v) if text_color_fn else C_TEXT
-            draw_centered_text(canvas, txt, (cx0 + cx1) // 2,
-                               (cy0 + cy1) // 2, color=color, scale=0.5)
+            draw_centered(canvas, txt, (cx0 + cx1) // 2, (cy0 + cy1) // 2,
+                          color=color, scale=text_scale, thickness=2)
 
 
-def draw_equation_card(canvas, x0, y0, x1, y1, header_lines, body_lines):
-    """
-    Draw a text card with a header and body. Used for the equation panel
-    on the right-hand side of panels 1 and 2.
+def draw_legend(canvas):
+    w, h = canvas.shape[1], canvas.shape[0]
+    y0 = h - 56
+    cv2.rectangle(canvas, (0, y0), (w, h), (14, 12, 12), -1)
+    cv2.line(canvas, (0, y0), (w, y0), C_BORDER, 1)
+    x, ymid = 20, y0 + 28
 
-    header_lines : list of (text, scale, color)
-    body_lines   : list of (text, scale, color)
-    """
-    cv2.rectangle(canvas, (x0, y0), (x1, y1), C_PANEL, -1)
-    cv2.rectangle(canvas, (x0, y0), (x1, y1), C_BORDER, 1)
-    y = y0 + 26
-    for text, scale, color in header_lines:
-        cv2.putText(canvas, text, (x0 + 12, y), FONT, scale, color,
-                    1, cv2.LINE_AA)
-        y += int(scale * 34) + 6
-    y += 4
-    for text, scale, color in body_lines:
-        cv2.putText(canvas, text, (x0 + 12, y), FONT, scale, color,
-                    1, cv2.LINE_AA)
-        y += int(scale * 30) + 4
+    def chip(color, label):
+        nonlocal x
+        cv2.rectangle(canvas, (x, ymid - 9), (x + 18, ymid + 9), color, -1)
+        x += 26
+        cv2.putText(canvas, label, (x, ymid + 7), F_BODY, 0.55,
+                    C_TEXT, 1, cv2.LINE_AA)
+        (tw, _), _ = cv2.getTextSize(label, F_BODY, 0.55, 1)
+        x += tw + 24
+
+    chip(C_POS, "positive"); chip(C_NEG, "negative"); chip(C_ZERO, "zero")
+    cv2.drawMarker(canvas, (x + 9, ymid), C_YELLOW,
+                   cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
+    x += 26
+    cv2.putText(canvas, "mouse picks pixel", (x, ymid + 7),
+                F_BODY, 0.55, C_TEXT, 1, cv2.LINE_AA)
+    (tw, _), _ = cv2.getTextSize("mouse picks pixel", F_BODY, 0.55, 1)
+    x += tw + 24
+    cv2.putText(canvas,
+                "[1-4] panel  [k] kernel  [m] SE  [o] dil/ero  "
+                "[l] LAB/DEMO  [q] quit",
+                (x, ymid + 7), F_BODY, 0.55, C_AMBER, 1, cv2.LINE_AA)
 
 
-def resize_panel(panel, w, h):
-    """Resize a math panel canvas to the target window size."""
-    return cv2.resize(panel, (w, h), interpolation=cv2.INTER_AREA)
+def draw_section_header(canvas, x0, y0, col_w, num, title, subtitle,
+                        active=True):
+    draw_badge(canvas, x0 + 34, y0 + 30, num, radius=24, active=active)
+    cv2.putText(canvas, title, (x0 + 70, y0 + 40),
+                F_TITLE, 0.85, C_TEXT, 2, cv2.LINE_AA)
+    cv2.putText(canvas, subtitle, (x0 + 18, y0 + 78),
+                F_BODY, 0.55, C_MUTED, 1, cv2.LINE_AA)
 
 
 # ============================================================================
-# SECTION 4 — PIXEL NEIGHBORHOOD EXTRACTION (shared by Panels 1 & 2)
+# PATCH EXTRACTION
 # ============================================================================
-# This is the single most important helper in the file. It grabs the k x k
-# patch centered at (x, y). Out-of-bounds pixels are treated as 0 (zero
-# padding), which is what cv2.filter2D does by default at the borders.
-# ----------------------------------------------------------------------------
-
 def extract_patch(gray, x, y, k):
-    """
-    Return the k x k neighborhood centered at (x, y), zero-padded at edges.
-
-    For k = 3 and center (x, y), the patch is:
-
-        [ I(x-1, y-1)  I(x, y-1)  I(x+1, y-1) ]
-        [ I(x-1, y  )  I(x, y  )  I(x+1, y  ) ]
-        [ I(x-1, y+1)  I(x, y+1)  I(x+1, y+1) ]
-
-    where I(...) is 0 outside the image bounds.
-    """
     h, w = gray.shape
     r = k // 2
     patch = np.zeros((k, k), dtype=np.float32)
     for i in range(k):
         for j in range(k):
-            yy = y + i - r
-            xx = x + j - r
+            yy, xx = y + i - r, x + j - r
             if 0 <= yy < h and 0 <= xx < w:
                 patch[i, j] = gray[yy, xx]
     return patch
 
 
 # ============================================================================
-# SECTION 5 — PANEL 1: KERNEL CONVOLUTION ARITHMETIC
+# PANEL 1 — KERNEL
 # ============================================================================
-# The demo: pick a pixel, extract its k x k neighborhood, multiply each
-# cell by the corresponding kernel coefficient, sum the products. That sum
-# is the output pixel value at the center location.
-#
-#   G(x, y) = sum_u sum_v  I(x+u, y+v) * K(u, v)
-#
-# We show four side-by-side regions:
-#   1. Neighborhood I(x+u, y+v)
-#   2. Kernel K(u, v)
-#   3. Elementwise products I * K
-#   4. The equation with the actual numbers substituted in
-# ----------------------------------------------------------------------------
-
 def convolve_at(gray, x, y, kernel):
-    """
-    Compute the convolution result at (x, y).
-
-    Returns
-    -------
-    patch    : k x k neighborhood (float)
-    products : k x k elementwise product of patch and kernel
-    raw_sum  : the raw sum (may overflow [0, 255])
-    clipped  : the value that would be stored in a uint8 image
-    """
     k = kernel.shape[0]
     patch = extract_patch(gray, x, y, k)
     products = patch * kernel
-    raw_sum = float(products.sum())
-    clipped = int(np.clip(abs(raw_sum), 0, 255))  # magnitude, clamped
-    return patch, products, raw_sum, clipped
+    raw = float(products.sum())
+    return patch, products, raw, int(np.clip(abs(raw), 0, 255))
 
 
-def render_kernel_panel(gray, x, y, kernel_name):
-    """Build the full Panel 1 canvas for the given pixel and kernel."""
+def render_kernel_panel(gray, x, y, kernel_name, cw, ch):
     kernel = KERNELS[kernel_name]
     k = kernel.shape[0]
     patch, products, raw_sum, clipped = convolve_at(gray, x, y, kernel)
 
-    canvas = blank_canvas(MATH_W, MATH_H)
+    canvas = blank_canvas(cw, ch)
+    header_h, legend_h = 100, 56
+    body_h = ch - header_h - legend_h
+    half_w = cw // 2
+    half_h = body_h // 2
 
-    # Reserve the four columns. Each column is MATH_W // 4 wide.
-    col_w = MATH_W // 4
-    pad = 14
+    avail_w = half_w - 40
+    avail_h = half_h - 100
+    cell = min(avail_w // max(k, 1), avail_h // max(k, 1), 90)
 
-    # --- Column 1: neighborhood ---
-    x0 = pad
-    draw_title(canvas, f"Neighborhood I(x+u, y+v)  @({x},{y})", x0, 26,
-               color=C_TITLE)
-    cell = min((col_w - 2 * pad) // k, 46)
-    grid_x = x0 + (col_w - 2 * pad - k * cell) // 2
-    grid_y = 48
-    draw_number_grid(
-        canvas, patch, grid_x, grid_y, cell, cell,
-        text_color_fn=lambda v: C_GREEN if v > 128 else C_ACCENT,
-    )
-
-    # --- Column 2: kernel ---
-    x0 = pad + col_w
-    draw_title(canvas, f"Kernel K[u,v]  ({kernel_name})", x0, 26,
-               color=C_TITLE)
-    grid_x = x0 + (col_w - 2 * pad - k * cell) // 2
-    def kernel_color(v):
-        if v > 0:  return C_POS
-        if v < 0:  return C_NEG
+    def kcolor(v):
+        if v > 0: return C_POS
+        if v < 0: return C_NEG
         return C_ZERO
-    draw_number_grid(
-        canvas, kernel, grid_x, grid_y, cell, cell,
-        text_color_fn=kernel_color,
-    )
 
-    # --- Column 3: products ---
-    x0 = pad + 2 * col_w
-    draw_title(canvas, "Elementwise I * K", x0, 26, color=C_TITLE)
-    grid_x = x0 + (col_w - 2 * pad - k * cell) // 2
-    def product_color(v):
-        if v > 0:  return C_POS
-        if v < 0:  return C_NEG
-        return C_ZERO
-    draw_number_grid(
-        canvas, products, grid_x, grid_y, cell, cell,
-        text_color_fn=product_color,
-    )
+    draw_section_header(canvas, 0, 0, half_w, 1, "PIXEL NEIGHBORHOOD",
+                        f"The {k}x{k} pixels around ({x}, {y})")
+    gx = (half_w - k * cell) // 2
+    gy = 100
+    draw_number_grid(canvas, patch, gx, gy, cell, cell,
+                     text_color_fn=lambda v: C_POS if v > 128 else C_AMBER,
+                     text_scale=1.0)
+    cv2.line(canvas, (half_w, 0), (half_w, header_h + body_h), C_BORDER, 1)
+    cv2.line(canvas, (0, half_h), (cw, half_h), C_BORDER, 1)
 
-    # --- Column 4: equation ---
-    x0 = pad + 3 * col_w
-    card_x0 = x0
-    card_x1 = MATH_W - pad
-    card_y0 = 12
-    card_y1 = MATH_H - 12
+    draw_section_header(canvas, half_w, 0, half_w, 2, "KERNEL",
+                        f"The operator '{kernel_name}' applied to it")
+    gx = half_w + (half_w - k * cell) // 2
+    gy = 100
+    draw_number_grid(canvas, kernel, gx, gy, cell, cell,
+                     text_color_fn=kcolor, border_color=C_AMBER,
+                     text_scale=1.0)
 
-    # Build the equation string with actual numbers substituted in.
+    draw_section_header(canvas, 0, half_h, half_w, 3, "PRODUCTS",
+                        "Multiply each cell pair")
+    gx = (half_w - k * cell) // 2
+    gy = half_h + 100
+    draw_number_grid(canvas, products, gx, gy, cell, cell,
+                     text_color_fn=kcolor, text_scale=1.0)
+
+    draw_section_header(canvas, half_w, half_h, half_w, 4, "RESULT",
+                        "Sum all products -> output pixel")
+    eq_x = half_w + 30
+    eq_y = half_h + 130
+    cv2.putText(canvas, "G(x,y) = Sum Sum I*K",
+                (eq_x, eq_y), F_TITLE, 0.85, C_AMBER, 2, cv2.LINE_AA)
+    eq_y += 44
     terms = []
     for i in range(k):
         for j in range(k):
-            p = int(patch[i, j])
             c = kernel[i, j]
-            if c == 0:
-                terms.append(f"({p})(0)")
-            else:
-                sign = "+" if c > 0 else "-"
-                terms.append(f"{sign}({p})({abs(int(c)) if c == int(c) else abs(c)})")
-    eq = " ".join(terms)
-    # Wrap roughly to fit the card
-    wrapped = []
-    line = ""
-    for tok in eq.split(" "):
-        if len(line) + len(tok) + 1 > 36:
-            wrapped.append(line)
-            line = tok
+            if c == 0: continue
+            s = "+" if c > 0 else "-"
+            cc = abs(int(c)) if c == int(c) else abs(c)
+            terms.append(f"{s} {int(patch[i,j])}.{cc}")
+    expr = " ".join(terms)
+    if expr.startswith("+ "): expr = expr[2:]
+    lines, cur = [], ""
+    for tok in expr.split(" "):
+        if len(cur) + len(tok) + 1 > 32:
+            lines.append(cur); cur = tok
         else:
-            line = (line + " " + tok) if line else tok
-    if line:
-        wrapped.append(line)
-    wrapped = wrapped[:6]  # cap so we don't overrun the card
+            cur = (cur + " " + tok) if cur else tok
+    if cur: lines.append(cur)
+    for line in lines[:3]:
+        cv2.putText(canvas, line, (eq_x, eq_y), F_BODY, 0.6,
+                    C_TEXT, 1, cv2.LINE_AA)
+        eq_y += 30
+    eq_y += 12
+    cv2.putText(canvas, f"sum = {int(raw_sum)}",
+                (eq_x, eq_y), F_TITLE, 1.4, C_POS, 3, cv2.LINE_AA)
+    eq_y += 52
+    cv2.putText(canvas, f"clip(|sum|) = {clipped}",
+                (eq_x, eq_y), F_BODY, 0.6, C_MUTED, 1, cv2.LINE_AA)
+    eq_y += 32
+    cv2.putText(canvas, "-> output pixel",
+                (eq_x, eq_y), F_BODY, 0.6, C_GREEN, 1, cv2.LINE_AA)
 
-    body = [("= " + wrapped[0], 0.42, C_TEXT)]
-    for w_line in wrapped[1:]:
-        body.append(("  " + w_line, 0.42, C_TEXT))
-    body.append(("", 0.2, C_TEXT))
-    body.append((f"sum = {int(raw_sum)}", 0.55, C_ACCENT))
-    body.append((f"clip(|sum|) = {clipped}", 0.55, C_GREEN))
-
-    draw_equation_card(
-        canvas, card_x0, card_y0, card_x1, card_y1,
-        header_lines=[
-            ("G(x,y) = \u03A3\u03A3 I \u00B7 K", 0.6, C_TITLE),
-        ],
-        body_lines=body,
-    )
-
+    draw_legend(canvas)
     return canvas
 
 
 # ============================================================================
-# SECTION 6 — PANEL 2: MORPHOLOGY ARITHMETIC
+# PANEL 2 — MORPHOLOGY
 # ============================================================================
-# The demo: pick a pixel, extract its k x k neighborhood, and look at ONLY
-# the cells where the structuring element is 1. Reduce those values with
-# max (dilation) or min (erosion). That reduction is the output pixel.
-#
-#   Dilation:  (f (+) b)(x) = sup_{h in B}  f(x - h) + b(h)
-#   Erosion:   (f (-) b)(x) = inf_{h in B}  f(x + h) - b(h)
-#
-# For a flat SE (b == 0), these reduce to local max and local min:
-#
-#   (f (+) b)(x) = max_{h in B} f(x - h)
-#   (f (-) b)(x) = min_{h in B} f(x + h)
-#
-# The panel shows which cells participate in the reduction.
-# ----------------------------------------------------------------------------
-
 def morph_at(gray, x, y, se, op):
-    """
-    Compute the morphological operation at (x, y).
-
-    Returns
-    -------
-    patch   : k x k neighborhood
-    active  : the values under the SE footprint, in scan order
-    result  : the max (dilate) or min (erode) of those values
-    """
     k = se.shape[0]
     patch = extract_patch(gray, x, y, k)
     mask = se > 0
     active = patch[mask]
-    if op == "dilate":
-        result = float(active.max()) if active.size else 0.0
-    else:
-        result = float(active.min()) if active.size else 0.0
+    result = (float(active.max()) if op == "dilate"
+              else float(active.min())) if active.size else 0.0
     return patch, active, result
 
 
-def render_morph_panel(gray, x, y, se_name, op):
-    """Build the full Panel 2 canvas for the given pixel, SE, and op."""
+def render_morph_panel(gray, x, y, se_name, op, cw, ch):
     se = SE_KERNELS[se_name]
     k = se.shape[0]
     patch, active, result = morph_at(gray, x, y, se, op)
 
-    canvas = blank_canvas(MATH_W, MATH_H)
-    col_w = MATH_W // 4
-    pad = 14
-    cell = min((col_w - 2 * pad) // k, 40)
+    canvas = blank_canvas(cw, ch)
+    header_h, legend_h = 100, 56
+    body_h = ch - header_h - legend_h
+    half_w = cw // 2
+    half_h = body_h // 2
 
-    # --- Column 1: neighborhood ---
-    x0 = pad
-    draw_title(canvas, f"Neighborhood  @({x},{y})", x0, 26, color=C_TITLE)
-    grid_x = x0 + (col_w - 2 * pad - k * cell) // 2
-    grid_y = 48
-    draw_number_grid(
-        canvas, patch, grid_x, grid_y, cell, cell,
-        text_color_fn=lambda v: C_TEXT,
-    )
+    avail_w = half_w - 40
+    avail_h = half_h - 100
+    cell = min(avail_w // max(k, 1), avail_h // max(k, 1), 80)
 
-    # --- Column 2: SE mask ---
-    x0 = pad + col_w
-    draw_title(canvas, f"SE: {se_name}   ({op})", x0, 26, color=C_TITLE)
-    grid_x = x0 + (col_w - 2 * pad - k * cell) // 2
-    # Show 1s in green, 0s in dark gray
-    se_display = se.astype(np.float32)
-    def se_color(v):
-        return C_GREEN if v > 0 else C_ZERO
-    draw_number_grid(canvas, se_display, grid_x, grid_y, cell, cell,
-                     text_color_fn=se_color)
+    draw_section_header(canvas, 0, 0, half_w, 1, "PIXEL NEIGHBORHOOD",
+                        f"The {k}x{k} pixels around ({x}, {y})")
+    gx = (half_w - k * cell) // 2
+    gy = 100
+    draw_number_grid(canvas, patch, gx, gy, cell, cell,
+                     text_color_fn=lambda v: C_TEXT)
+    cv2.line(canvas, (half_w, 0), (half_w, header_h + body_h), C_BORDER, 1)
+    cv2.line(canvas, (0, half_h), (cw, half_h), C_BORDER, 1)
 
-    # --- Column 3: masked values (values under the SE footprint) ---
-    x0 = pad + 2 * col_w
-    draw_title(canvas, "Values under SE", x0, 26, color=C_TITLE)
-    # Show the full patch but gray out cells not under the SE
-    masked_patch = np.where(se > 0, patch, np.nan).astype(np.float32)
-    grid_x = x0 + (col_w - 2 * pad - k * cell) // 2
-    # Draw the base patch first (grayed out), then overlay active cells
-    for r in range(k):
-        for c in range(k):
-            cx0 = grid_x + c * cell
-            cy0 = grid_y + r * cell
-            cx1 = cx0 + cell
-            cy1 = cy0 + cell
-            if se[r, c] > 0:
-                cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), C_PANEL, -1)
-                cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), C_GREEN, 2)
-                txt = f"{int(patch[r, c])}"
-                draw_centered_text(canvas, txt,
-                                   (cx0 + cx1) // 2, (cy0 + cy1) // 2,
-                                   color=C_GREEN, scale=0.5)
-            else:
-                cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), C_PANEL, -1)
-                cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), C_BORDER, 1)
-                txt = f"{int(patch[r, c])}"
-                draw_centered_text(canvas, txt,
-                                   (cx0 + cx1) // 2, (cy0 + cy1) // 2,
-                                   color=C_ZERO, scale=0.5)
+    draw_section_header(canvas, half_w, 0, half_w, 2, "STRUCTURING ELEMENT",
+                        f"Shape '{se_name}'", active=True)
+    gx = half_w + (half_w - k * cell) // 2
+    gy = 100
+    draw_number_grid(canvas, se.astype(np.float32), gx, gy, cell, cell,
+                     text_color_fn=lambda v: C_POS if v > 0 else C_ZERO,
+                     border_color=C_AMBER)
 
-    # --- Column 4: reduction card ---
-    x0 = pad + 3 * col_w
-    card_x0 = x0
-    card_x1 = MATH_W - pad
-    card_y0 = 12
-    card_y1 = MATH_H - 12
+    draw_section_header(canvas, 0, half_h, half_w, 3, "ACTIVE VALUES",
+                        "Only cells under the SE footprint")
+    gx = (half_w - k * cell) // 2
+    gy = half_h + 100
+    draw_number_grid(canvas, patch, gx, gy, cell, cell,
+                     text_color_fn=lambda v: C_POS if v > 0 else C_MUTED,
+                     bg_fn=lambda r, c: C_PANEL_HI if se[r, c] > 0 else C_PANEL,
+                     strike_fn=lambda r, c: se[r, c] == 0)
 
-    reduction_name = "max" if op == "dilate" else "min"
-    # Build the reduction expression from the actual active values
-    vals_str = ", ".join(str(int(v)) for v in active[:12])
-    if active.size > 12:
-        vals_str += f", ... ({active.size} total)"
+    red = "max" if op == "dilate" else "min"
+    verb = "dilation" if op == "dilate" else "erosion"
+    draw_section_header(canvas, half_w, half_h, half_w, 4, "REDUCTION",
+                        f"Reduce with {red} ({verb})")
+    eq_x = half_w + 30
+    eq_y = half_h + 130
+    op_sym = "(f (+) b)" if op == "dilate" else "(f (-) b)"
+    cv2.putText(canvas, f"{verb.capitalize()} {op_sym}",
+                (eq_x, eq_y), F_TITLE, 0.85, C_AMBER, 2, cv2.LINE_AA)
+    eq_y += 44
+    vals = [int(v) for v in active[:10]]
+    vstr = ", ".join(str(v) for v in vals)
+    if active.size > 10:
+        vstr += f", ... ({active.size} total)"
+    cv2.putText(canvas, f"= {red}{{ {vstr} }}",
+                (eq_x, eq_y), F_BODY, 0.6, C_TEXT, 1, cv2.LINE_AA)
+    eq_y += 60
+    cv2.putText(canvas, f"= {int(result)}",
+                (eq_x, eq_y), F_TITLE, 1.4, C_POS, 3, cv2.LINE_AA)
+    eq_y += 52
+    cv2.putText(canvas, "-> output pixel",
+                (eq_x, eq_y), F_BODY, 0.6, C_GREEN, 1, cv2.LINE_AA)
 
-    # Header line shows the operator with its formal name
-    if op == "dilate":
-        header = [("Dilation  (f \u2295 b)", 0.6, C_TITLE)]
-    else:
-        header = [("Erosion  (f \u2296 b)", 0.6, C_TITLE)]
-
-    body = [
-        (f"= {reduction_name}{{", 0.5, C_TEXT),
-        (f"   {vals_str}", 0.42, C_TEXT),
-        ("  }", 0.5, C_TEXT),
-        ("", 0.2, C_TEXT),
-        (f"= {int(result)}", 0.75, C_ACCENT),
-        ("\u2190 output pixel", 0.45, C_GREEN),
-    ]
-
-    draw_equation_card(
-        canvas, card_x0, card_y0, card_x1, card_y1,
-        header_lines=header,
-        body_lines=body,
-    )
-
+    draw_legend(canvas)
     return canvas
 
-    # ============================================================================
-# SECTION 7 — PANEL 3: OTSU THRESHOLDING WITH LIVE sigma_B^2(T) CURVE
+
 # ============================================================================
-# Otsu's method finds the threshold T that maximizes the between-class
-# variance of the intensity histogram:
-#
-#     sigma_B^2(T) = omega_0(T) * omega_1(T) * (mu_0(T) - mu_1(T))^2
-#
-# where omega_0 and omega_1 are the class probabilities (masses of the
-# histogram below/above T) and mu_0, mu_1 are the class means.
-#
-# The optimum is:
-#
-#     T* = argmax_T sigma_B^2(T)
-#
-# We plot:
-#   1. The histogram (with T* marked)
-#   2. The sigma_B^2(T) curve (with the peak marked)
-#   3. An arithmetic card showing omega_0, omega_1, mu_0, mu_1 at T*
-#
-# Rendering is done in matplotlib and cached as a numpy array. We only
-# redraw every MATH_REDRAW_EVERY frames for performance.
-# ----------------------------------------------------------------------------
-
+# PANEL 3 — OTSU
+# ============================================================================
 def compute_otsu(gray):
-    """
-    Vectorized Otsu. Returns (T_star, sigma_B2_curve, hist, mu_T).
-
-    Uses the cumsum trick to evaluate all 256 candidate thresholds at once.
-    """
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
     total = int(hist.sum())
     if total == 0:
         return 0, np.zeros(256), hist, 0.0
-
     p = hist.astype(np.float64) / total
-    omega = np.cumsum(p)                              # omega_0(T)
-    levels = np.arange(256, dtype=np.float64)
-    mu_cum = np.cumsum(levels * p)
+    omega = np.cumsum(p)
+    lv = np.arange(256, dtype=np.float64)
+    mu_cum = np.cumsum(lv * p)
     mu_T = mu_cum[-1]
-
-    denom = omega * (1.0 - omega)
-    denom = np.where(denom < 1e-12, 1e-12, denom)
+    denom = np.maximum(omega * (1.0 - omega), 1e-12)
     sigma_B2 = (mu_T * omega - mu_cum) ** 2 / denom
-    T_star = int(np.argmax(sigma_B2))
-    return T_star, sigma_B2, hist, mu_T
+    return int(np.argmax(sigma_B2)), sigma_B2, hist, mu_T
 
 
 def fig_to_bgr(fig):
-    """Rasterize a matplotlib figure into a BGR numpy array and close it."""
     fig.canvas.draw()
     buf = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
     bgr = cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR).copy()
@@ -601,382 +438,227 @@ def fig_to_bgr(fig):
     return bgr
 
 
-def render_otsu_panel(gray):
-    """Render the Otsu panel as a matplotlib figure, return it as BGR."""
+def render_otsu_panel(gray, cw, ch):
     T_star, sigma_B2, hist, mu_T = compute_otsu(gray)
-
-    fig = plt.figure(figsize=(14, 4.2), dpi=100, facecolor="#121218")
+    fig = plt.figure(figsize=(cw / 100, ch / 100), dpi=100,
+                     facecolor="#121218")
     gs = GridSpec(1, 3, figure=fig, wspace=0.28,
-                  left=0.05, right=0.98, top=0.86, bottom=0.14)
-
-    # --- (a) histogram ---
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.set_facecolor("#1a1a24")
+                  left=0.05, right=0.98, top=0.85, bottom=0.15)
+    ax1 = fig.add_subplot(gs[0, 0]); ax1.set_facecolor("#1a1a24")
     ax1.bar(np.arange(256), hist, width=1.0, color="#4ea8de")
     ax1.axvline(T_star, color="#ff4757", linestyle="--", linewidth=2)
-    ax1.set_title(f"Histogram (mu_T = {mu_T:.1f})",
-                  color="#e6e6f0", fontsize=11)
-    ax1.set_xlabel("intensity", color="#c8c8d8")
-    ax1.tick_params(colors="#c8c8d8")
-    for s in ax1.spines.values():
-        s.set_color("#5a5a6e")
+    ax1.set_title(f"Histogram  mu_T = {mu_T:.1f}", color="#e8e8f0", fontsize=14)
+    ax1.tick_params(colors="#c8c8d8", labelsize=11)
+    for s in ax1.spines.values(): s.set_color("#5a5a6e")
 
-    # --- (b) sigma_B^2(T) ---
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.set_facecolor("#1a1a24")
-    ax2.plot(sigma_B2, color="#a3e635", linewidth=2)
+    ax2 = fig.add_subplot(gs[0, 1]); ax2.set_facecolor("#1a1a24")
+    ax2.plot(sigma_B2, color="#7dffa0", linewidth=3)
     ax2.axvline(T_star, color="#ff4757", linestyle="--", linewidth=2)
-    ax2.plot(T_star, sigma_B2[T_star], "o", color="#ff4757",
-             markersize=11, zorder=5)
-    ax2.set_title("sigma_B^2(T)  —  between-class variance",
-                  color="#e6e6f0", fontsize=11)
-    ax2.set_xlabel("threshold T", color="#c8c8d8")
-    ax2.tick_params(colors="#c8c8d8")
-    for s in ax2.spines.values():
-        s.set_color("#5a5a6e")
+    ax2.plot(T_star, sigma_B2[T_star], "o", color="#ff4757", markersize=12)
+    ax2.set_title("sigma_B^2(T)", color="#e8e8f0", fontsize=14)
+    ax2.tick_params(colors="#c8c8d8", labelsize=11)
+    for s in ax2.spines.values(): s.set_color("#5a5a6e")
 
-    # --- (c) arithmetic card ---
-    ax3 = fig.add_subplot(gs[0, 2])
-    ax3.set_facecolor("#1a1a24")
+    ax3 = fig.add_subplot(gs[0, 2]); ax3.set_facecolor("#1a1a24")
     ax3.set_xticks([]); ax3.set_yticks([])
-    for s in ax3.spines.values():
-        s.set_color("#5a5a6e")
-
+    for s in ax3.spines.values(): s.set_color("#5a5a6e")
     p = hist.astype(np.float64) / max(hist.sum(), 1)
-    omega0 = p[: T_star + 1].sum()
-    omega1 = 1.0 - omega0
-    levels = np.arange(256, dtype=np.float64)
-    mu0 = (levels[: T_star + 1] * p[: T_star + 1]).sum() / max(omega0, 1e-12)
-    mu1 = (levels[T_star + 1:] * p[T_star + 1:]).sum() / max(omega1, 1e-12)
-    sb2_star = omega0 * omega1 * (mu0 - mu1) ** 2
-
-    ax3.text(0.02, 0.92, "Otsu at T*", color="#ffd166",
-             fontsize=13, fontweight="bold", transform=ax3.transAxes)
-    ax3.text(0.02, 0.76, f"T* = argmax sigma_B^2(T) = {T_star}",
-             color="#e6e6f0", fontsize=11, family="monospace",
-             transform=ax3.transAxes)
-    ax3.text(0.02, 0.60, f"omega_0 = {omega0:.3f}    mu_0 = {mu0:.2f}",
-             color="#a3e635", fontsize=11, family="monospace",
-             transform=ax3.transAxes)
-    ax3.text(0.02, 0.48, f"omega_1 = {omega1:.3f}    mu_1 = {mu1:.2f}",
-             color="#a3e635", fontsize=11, family="monospace",
-             transform=ax3.transAxes)
-    ax3.text(0.02, 0.32, "sigma_B^2(T*) = omega_0 * omega_1 * (mu_0-mu_1)^2",
-             color="#4ea8de", fontsize=10, family="monospace",
-             transform=ax3.transAxes)
-    ax3.text(0.02, 0.14, f"= {sb2_star:.1f}",
-             color="#ff4757", fontsize=18, fontweight="bold",
-             transform=ax3.transAxes)
-
+    o0 = p[: T_star + 1].sum(); o1 = 1.0 - o0
+    lv = np.arange(256, dtype=np.float64)
+    m0 = (lv[: T_star + 1] * p[: T_star + 1]).sum() / max(o0, 1e-12)
+    m1 = (lv[T_star + 1:] * p[T_star + 1:]).sum() / max(o1, 1e-12)
+    sb2 = o0 * o1 * (m0 - m1) ** 2
+    ax3.text(0.03, 0.90, "Otsu's optimum", color="#ffd166",
+             fontsize=16, fontweight="bold", transform=ax3.transAxes)
+    ax3.text(0.03, 0.74, f"T* = {T_star}", color="#e8e8f0",
+             fontsize=14, family="monospace", transform=ax3.transAxes)
+    ax3.text(0.03, 0.56, f"w0={o0:.3f}  m0={m0:.2f}", color="#7dffa0",
+             fontsize=12, family="monospace", transform=ax3.transAxes)
+    ax3.text(0.03, 0.44, f"w1={o1:.3f}  m1={m1:.2f}", color="#7dffa0",
+             fontsize=12, family="monospace", transform=ax3.transAxes)
+    ax3.text(0.03, 0.08, f"sigma_B^2 = {sb2:.1f}", color="#ff4757",
+             fontsize=20, fontweight="bold", transform=ax3.transAxes)
     return fig_to_bgr(fig)
 
 
 # ============================================================================
-# SECTION 8 — PANEL 4: HOUGH ACCUMULATOR
+# PANEL 4 — HOUGH
 # ============================================================================
-# The Hough transform detects lines by voting in (rho, theta) space. Each
-# edge pixel (x_i, y_i) votes for every line that passes through it:
-#
-#     rho = x_i * cos(theta) + y_i * sin(theta)
-#
-# In the (rho, theta) plane, that equation traces a sinusoid. Where many
-# sinusoids cross, many pixels agree on a line — that crossing is the peak
-# of the accumulator A(rho, theta).
-#
-# This panel shows:
-#   1. The Canny edge map (source of votes)
-#   2. The accumulator A(rho, theta) with the top-3 peaks marked
-#   3. The detected lines drawn back on the edge map
-# ----------------------------------------------------------------------------
-
-def hough_lines(edges, rho_res=1.0, theta_res=np.pi / 180.0,
-                n_peaks=3, min_votes=20):
-    """
-    Compute a Hough accumulator and return the top-N peaks.
-
-    Returns
-    -------
-    acc     : accumulator (n_rho, n_theta)
-    rhos    : array of rho values
-    thetas  : array of theta values
-    peaks   : list of (rho, theta, votes)
-    """
+def hough_lines(edges, n=3, min_votes=20):
     h, w = edges.shape
     diag = int(np.ceil(np.hypot(h, w)))
-    rhos = np.arange(-diag, diag + 1, rho_res)
-    thetas = np.arange(0, np.pi, theta_res)
+    rhos = np.arange(-diag, diag + 1, 1.0)
+    thetas = np.arange(0, np.pi, np.pi / 180.0)
     acc = np.zeros((len(rhos), len(thetas)), dtype=np.int32)
-
     ys, xs = np.nonzero(edges)
-    if len(xs) == 0:
-        return acc, rhos, thetas, []
-
-    # Subsample for performance
-    if len(xs) > 2000:
-        idx = np.random.choice(len(xs), 2000, replace=False)
+    if len(xs) == 0: return acc, rhos, thetas, []
+    if len(xs) > 1500:
+        idx = np.random.choice(len(xs), 1500, replace=False)
         xs, ys = xs[idx], ys[idx]
-
-    cos_t = np.cos(thetas)
-    sin_t = np.sin(thetas)
+    ct, st = np.cos(thetas), np.sin(thetas)
     for x, y in zip(xs, ys):
-        rho_vals = x * cos_t + y * sin_t
-        rho_idx = np.round((rho_vals + diag) / rho_res).astype(int)
-        valid = (rho_idx >= 0) & (rho_idx < len(rhos))
-        acc[rho_idx[valid], np.arange(len(thetas))[valid]] += 1
-
-    # Greedy peak selection with local suppression
-    acc_work = acc.copy()
-    peaks = []
-    for _ in range(n_peaks):
-        if acc_work.max() < min_votes:
-            break
-        r_idx, t_idx = np.unravel_index(np.argmax(acc_work), acc_work.shape)
-        votes = int(acc_work[r_idx, t_idx])
-        peaks.append((float(rhos[r_idx]), float(thetas[t_idx]), votes))
-        # Suppress a window around the peak so we don't re-detect it
-        r_lo = max(0, r_idx - 20); r_hi = min(acc_work.shape[0], r_idx + 21)
-        t_lo = max(0, t_idx - 10); t_hi = min(acc_work.shape[1], t_idx + 11)
-        acc_work[r_lo:r_hi, t_lo:t_hi] = 0
-
+        r = x * ct + y * st
+        ri = np.round(r + diag).astype(int)
+        ok = (ri >= 0) & (ri < len(rhos))
+        acc[ri[ok], np.arange(len(thetas))[ok]] += 1
+    aw = acc.copy(); peaks = []
+    for _ in range(n):
+        if aw.max() < min_votes: break
+        ri, ti = np.unravel_index(np.argmax(aw), aw.shape)
+        peaks.append((float(rhos[ri]), float(thetas[ti]), int(aw[ri, ti])))
+        aw[max(0, ri - 20):ri + 21, max(0, ti - 10):ti + 11] = 0
     return acc, rhos, thetas, peaks
 
 
-def render_hough_panel(edges):
-    """Render the Hough panel as a matplotlib figure, return it as BGR."""
+def render_hough_panel(edges, cw, ch):
     acc, rhos, thetas, peaks = hough_lines(edges)
-
-    fig = plt.figure(figsize=(14, 4.2), dpi=100, facecolor="#121218")
+    fig = plt.figure(figsize=(cw / 100, ch / 100), dpi=100,
+                     facecolor="#121218")
     gs = GridSpec(1, 2, figure=fig, wspace=0.22,
-                  left=0.05, right=0.98, top=0.86, bottom=0.14)
-
-    # --- (a) edge map with detected lines overlaid ---
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.set_facecolor("#1a1a24")
+                  left=0.05, right=0.98, top=0.85, bottom=0.15)
+    ax1 = fig.add_subplot(gs[0, 0]); ax1.set_facecolor("#1a1a24")
     ax1.imshow(edges, cmap="gray")
-    ax1.set_title("Edge map + detected lines", color="#e6e6f0", fontsize=11)
+    ax1.set_title("Edge map + detected lines", color="#e8e8f0", fontsize=14)
     ax1.set_xticks([]); ax1.set_yticks([])
-
     h, w = edges.shape
-    for (rho, theta, votes) in peaks:
-        ct, st = np.cos(theta), np.sin(theta)
-        # Two points on the line: x=0 and x=w-1
-        x0, y0 = 0, rho / max(st, 1e-9)
-        x1, y1 = w - 1, (rho - (w - 1) * ct) / max(st, 1e-9)
-        ax1.plot([x0, x1], [y0, y1], "-", color="#ff4757",
-                 linewidth=2, alpha=0.85)
-
-    # --- (b) accumulator ---
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.set_facecolor("#1a1a24")
-    theta_deg = np.degrees(thetas)
-    # imshow with extent: origin="lower" to put rho increasing upward
-    extent = [theta_deg[0], theta_deg[-1], rhos[0], rhos[-1]]
-    ax2.imshow(acc, cmap="inferno", aspect="auto", extent=extent,
-               origin="lower")
-    ax2.set_xlabel("theta (degrees)", color="#c8c8d8")
-    ax2.set_ylabel("rho (pixels)", color="#c8c8d8")
-    ax2.set_title("Accumulator A(rho, theta)", color="#e6e6f0", fontsize=11)
-    ax2.tick_params(colors="#c8c8d8")
-    for s in ax2.spines.values():
-        s.set_color("#5a5a6e")
-
-    for i, (rho, theta, votes) in enumerate(peaks):
+    for (rho, theta, _) in peaks:
+        c, s = np.cos(theta), np.sin(theta)
+        ax1.plot([0, w - 1], [rho / max(s, 1e-9),
+                              (rho - (w - 1) * c) / max(s, 1e-9)],
+                 "-", color="#ff4757", linewidth=2)
+    ax2 = fig.add_subplot(gs[0, 1]); ax2.set_facecolor("#1a1a24")
+    td = np.degrees(thetas)
+    ax2.imshow(acc, cmap="inferno", aspect="auto",
+               extent=[td[0], td[-1], rhos[0], rhos[-1]], origin="lower")
+    ax2.set_xlabel("theta (deg)", color="#c8c8d8", fontsize=11)
+    ax2.set_ylabel("rho (px)", color="#c8c8d8", fontsize=11)
+    ax2.set_title("Accumulator A(rho, theta)", color="#e8e8f0", fontsize=14)
+    ax2.tick_params(colors="#c8c8d8", labelsize=11)
+    for s in ax2.spines.values(): s.set_color("#5a5a6e")
+    for i, (rho, theta, v) in enumerate(peaks):
         ax2.plot(np.degrees(theta), rho, "o", markerfacecolor="none",
                  markeredgecolor="#7dffa0", markeredgewidth=2.5,
                  markersize=14)
-        ax2.text(np.degrees(theta) + 4, rho,
-                 f"  peak {i+1}: {votes} votes",
-                 color="#7dffa0", fontsize=9, fontweight="bold")
-
+        ax2.text(np.degrees(theta) + 4, rho, f"  #{i+1}: {v}",
+                 color="#7dffa0", fontsize=10, fontweight="bold")
     return fig_to_bgr(fig)
 
 
 # ============================================================================
-# SECTION 9 — MOOD DETECTOR: FACE, ROI SPLIT, AU PROXIES
+# FACE DETECT
 # ============================================================================
-# Given a face box, split it into three horizontal bands (brow, eye, mouth)
-# and compute classical-CV features from each. Those features are proxies
-# for Facial Action Units (FACS):
-#
-#   AU12  lip corner puller     -> parabola curvature of the mouth contour
-#   AU6   cheek raiser          -> inverse of eye aspect ratio (proxy)
-#   AU4   brow lowerer          -> negative median Hough angle on brow
-#   AU1   inner brow raiser     -> positive median Hough angle on brow
-#   AU25  lips part             -> mouth aspect ratio (h / w)
-# ----------------------------------------------------------------------------
-
 def load_face_detector(script_dir):
-    """
-    Try DNN first, fall back to Haar. Returns (kind, detector).
-
-    kind is one of: "dnn", "haar", "none".
-    """
     proto = os.path.join(script_dir, "deploy.prototxt")
-    model = os.path.join(script_dir,
-                         "res10_300x300_ssd_iter_140000_fp16.caffemodel")
+    model = os.path.join(script_dir, "res10_300x300_ssd_iter_140000_fp16.caffemodel")
     if os.path.exists(proto) and os.path.exists(model):
         try:
             net = cv2.dnn.readNetFromCaffe(proto, model)
-            print(f"[focusguard] Loaded DNN face detector from {script_dir}")
+            print(f"[focusguard] DNN face detector loaded")
             return "dnn", net
         except cv2.error as e:
-            print(f"[focusguard] DNN load failed ({e}); falling back to Haar")
-    haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    if os.path.exists(haar_path):
-        print("[focusguard] Using Haar cascade fallback (DNN files missing)")
-        return "haar", cv2.CascadeClassifier(haar_path)
-    print("[focusguard] WARNING: no face detector available")
+            print(f"[focusguard] DNN failed: {e}")
+    haar = os.path.join(cv2.data.haarcascades,
+                        "haarcascade_frontalface_default.xml")
+    if os.path.exists(haar):
+        print("[focusguard] Using Haar cascade fallback")
+        return "haar", cv2.CascadeClassifier(haar)
     return "none", None
 
 
-def detect_face_dnn(net, frame_bgr, conf_thresh=0.5):
-    """Return the highest-confidence face box (x1,y1,x2,y2) or None."""
+def detect_face_dnn(net, frame_bgr, conf=0.7):
     h, w = frame_bgr.shape[:2]
-    blob = cv2.dnn.blobFromImage(
-        cv2.resize(frame_bgr, (300, 300)), 1.0, (300, 300),
-        (104.0, 177.0, 123.0),
-    )
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame_bgr, (300, 300)),
+                                 1.0, (300, 300), (104.0, 177.0, 123.0))
     net.setInput(blob)
     det = net.forward()
-    best, best_conf = None, conf_thresh
+    best, best_area = None, 0
     for i in range(det.shape[2]):
-        conf = float(det[0, 0, i, 2])
-        if conf > best_conf:
-            box = det[0, 0, i, 3:7] * np.array([w, h, w, h])
-            best = box.astype(int)
-            best_conf = conf
+        c = float(det[0, 0, i, 2])
+        if c < conf: continue
+        b = det[0, 0, i, 3:7] * np.array([w, h, w, h])
+        area = (b[2] - b[0]) * (b[3] - b[1])
+        if area < 0.02 * w * h: continue
+        if area > best_area:
+            best = b.astype(int)
+            best_area = area
     return best
 
 
 def detect_face_haar(haar, gray_small):
-    """Return the largest face box in the small image or None."""
     boxes = haar.detectMultiScale(gray_small, scaleFactor=1.15,
-                                  minNeighbors=5, minSize=(60, 60))
-    if len(boxes) == 0:
-        return None
-    # Largest by area
-    areas = [bw * bh for (_, _, bw, bh) in boxes]
-    idx = int(np.argmax(areas))
-    x, y, bw, bh = boxes[idx]
-    return np.array([x, y, x + bw, y + bh], dtype=int)
+                                  minNeighbors=6, minSize=(80, 80))
+    if len(boxes) == 0: return None
+    h, w = gray_small.shape[:2]
+    cx, cy = w / 2, h / 2
+    best, best_score = None, -1
+    for (x, y, bw, bh) in boxes:
+        bx, by = x + bw / 2, y + bh / 2
+        d = np.hypot(bx - cx, by - cy)
+        score = (bw * bh) - d * 50
+        if score > best_score:
+            best = np.array([x, y, x + bw, y + bh], dtype=int)
+            best_score = score
+    return best
 
 
-def mouth_au(gray, mouth_roi, mouth_roi_bgr):
-    """
-    Otsu on mouth ROI -> morphological opening + closing -> contour fit.
-
-    Returns (au12, au25, mask, T_star, sigma_B2) for visualization.
-    """
-    if mouth_roi.size == 0:
-        return 0.0, 0.0, np.zeros_like(gray), 0, None
-
-    # 1. Otsu threshold on the gray mouth ROI. Since lips are darker than
-    #    surrounding skin, use INV so mouth opening (interior) becomes white.
-    T_star, sigma_B2, _, _ = compute_otsu(mouth_roi)
-    _, mask = cv2.threshold(mouth_roi, T_star, 255, cv2.THRESH_BINARY_INV)
-
-    # 2. Morphological opening (removes lip speckle, salt noise)
-    #    opening = erosion followed by dilation: A o B = (A - B) + B
+# ============================================================================
+# MOOD / LIVENESS
+# ============================================================================
+def mouth_au(gray, roi):
+    if roi.size < 100:
+        return 0.0, 0.0, np.zeros_like(gray)
+    T, _, _, _ = compute_otsu(roi)
+    _, mask = cv2.threshold(roi, T, 255, cv2.THRESH_BINARY_INV)
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, se)
-
-    # 3. Morphological closing (fills small teeth gaps, pepper noise)
-    #    closing = dilation followed by erosion: A * B = (A + B) - B
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, se)
-
-    # 4. Largest contour -> parabolic fit to the top edge
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return 0.0, 0.0, mask, T_star, sigma_B2
-
+    if not cnts: return 0.0, 0.0, mask
     c = max(cnts, key=cv2.contourArea)
-    if len(c) < 5:
-        return 0.0, 0.0, mask, T_star, sigma_B2
-
+    area = cv2.contourArea(c)
+    roi_area = float(roi.shape[0] * roi.shape[1])
+    if area < 0.03 * roi_area or area > 0.55 * roi_area:
+        return 0.0, 0.0, mask
+    if len(c) < 5: return 0.0, 0.0, mask
     pts = c.reshape(-1, 2)
-    # Split points into left half and right half; use the upper envelope
-    # (smaller y = higher on screen) to fit a parabola that captures smile
-    # curvature. We fit y = a x^2 + b x + c using all contour points.
-    xs = pts[:, 0].astype(np.float64)
-    ys = pts[:, 1].astype(np.float64)
     try:
-        coeffs = np.polyfit(xs, ys, 2)
-        a = float(coeffs[0])
-    except (np.linalg.LinAlgError, ValueError):
+        a = float(np.polyfit(pts[:, 0].astype(np.float64),
+                             pts[:, 1].astype(np.float64), 2)[0])
+    except Exception:
         a = 0.0
-
-    # AU12: parabola curvature. Positive curvature (a > 0) => smile.
+    _, _, bw, bh = cv2.boundingRect(c)
+    if bh > 0.5 * bw:
+        return 0.0, 0.0, mask
     au12 = float(np.clip(-a * 200.0, 0.0, 1.0))
-
-    # AU25: mouth aspect ratio
-    _, _, w_box, h_box = cv2.boundingRect(c)
-    au25 = float(np.clip(h_box / max(w_box, 1) / 0.6, 0.0, 1.0))
-
-    return au12, au25, mask, T_star, sigma_B2
+    au25 = float(np.clip(bh / max(bw, 1) / 0.6, 0.0, 1.0))
+    return au12, au25, mask
 
 
-def eye_au(gray, eye_roi):
-    """Adaptive threshold on the eye ROI -> dark pixel ratio -> AU6 proxy."""
-    if eye_roi.size == 0:
-        return 0.0, np.zeros_like(gray)
-
-    # Adaptive mean threshold (handles changing classroom lighting)
-    mask = cv2.adaptiveThreshold(eye_roi, 255,
-                                 cv2.ADAPTIVE_THRESH_MEAN_C,
+def eye_au(gray, roi):
+    if roi.size < 100: return 0.0, np.zeros_like(gray)
+    mask = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                  cv2.THRESH_BINARY_INV, 15, 5)
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, se)
-
-    # Fraction of dark pixels
-    dark_ratio = float((mask > 0).sum()) / max(mask.size, 1)
-
-    # AU6 proxy: eye "squint" = inverse of openness. When the eye is wide
-    # open, dark_ratio is high (lots of pupil/iris). When squinting, the
-    # lids cover the eye and dark_ratio drops.
-    au6 = float(np.clip(1.0 - dark_ratio / 0.25, 0.0, 1.0))
-    return au6, mask
+    dr = float((mask > 0).sum()) / max(mask.size, 1)
+    return float(np.clip(1.0 - dr / 0.25, 0.0, 1.0)), mask
 
 
-def brow_au(gray, brow_roi):
-    """Canny + Hough on the brow ROI -> median line angle -> AU1 / AU4."""
-    if brow_roi.size == 0:
-        return 0.0, 0.0, np.zeros_like(gray), None
-
-    edges = cv2.Canny(brow_roi, 50, 150)
+def brow_au(gray, roi):
+    if roi.size < 100: return 0.0, 0.0, np.zeros_like(gray)
+    edges = cv2.Canny(roi, 50, 150)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=15,
                             minLineLength=15, maxLineGap=8)
-    if lines is None or len(lines) == 0:
-        return 0.0, 0.0, edges, None
-
-    angles = []
-    for l in lines:
-        x1, y1, x2, y2 = l[0]
-        ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-        # Fold into [0, 90) because brows are roughly horizontal
-        ang = abs(ang)
-        if ang > 90:
-            ang = 180 - ang
-        angles.append(ang)
-
-    median_ang = float(np.median(angles))
-
-    # AU1 (inner brow raiser, brow slants up toward center) vs AU4
-    # (brow lowerer, brow pushes down toward center). We use the sign
-    # of the mean signed angle as the discriminator.
-    signed = []
-    for l in lines:
-        x1, y1, x2, y2 = l[0]
-        signed.append(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
-    mean_signed = float(np.mean(signed))
-
-    au4 = float(np.clip(-mean_signed / 20.0, 0.0, 1.0))   # brow down
-    au1 = float(np.clip( mean_signed / 20.0, 0.0, 1.0))   # brow up
-    return au1, au4, edges, median_ang
+    if lines is None or len(lines) == 0: return 0.0, 0.0, edges
+    sgn = [np.degrees(np.arctan2(l[0][3] - l[0][1], l[0][2] - l[0][0]))
+           for l in lines]
+    m = float(np.mean(sgn))
+    return (float(np.clip(m / 20.0, 0.0, 1.0)),
+            float(np.clip(-m / 20.0, 0.0, 1.0)), edges)
 
 
-def init_kalman_mood(n=5):
-    """5-state Kalman filter, one state per AU, unity transition."""
+def init_kalman(n=5):
     kf = cv2.KalmanFilter(n, n)
     kf.transitionMatrix = np.eye(n, dtype=np.float32)
     kf.measurementMatrix = np.eye(n, dtype=np.float32)
@@ -987,526 +669,503 @@ def init_kalman_mood(n=5):
     return kf
 
 
-def classify_mood(au_vec):
-    """Rule-based classifier on the smoothed AU vector."""
-    au12, au6, au4, au1, au25 = au_vec
-    if au12 > 0.35 and au6 > 0.15:
-        return "happy"
-    if au4 > 0.40 and au1 < 0.20:
-        return "focused"
-    if au1 > 0.35 and au25 > 0.25:
-        return "surprised"
-    if au25 > 0.40:
-        return "talking"
+def classify_mood(au):
+    a12, a6, a4, a1, a25 = au
+    if a12 > 0.40 and a6 > 0.15:  return "happy"
+    if a4 > 0.40 and a1 < 0.20:   return "focused"
+    if a1 > 0.35 and a25 > 0.25:  return "surprised"
+    if a25 > 0.40:                return "talking"
     return "neutral"
 
 
-# ============================================================================
-# SECTION 10 — LIVENESS: OPTICAL FLOW ON FACE CORNERS
-# ============================================================================
-# A printed photo of a face is static. A live face has micro-motion: breathing,
-# head drift, eye blinks. We measure the mean optical flow magnitude on a
-# sparse set of corners inside the face box. If it's below a threshold, we
-# declare the input suspicious ("SPOOF?").
-# ----------------------------------------------------------------------------
-
-LK_PARAMS = dict(
-    winSize=(15, 15),
-    maxLevel=2,
-    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
-)
+LK = dict(winSize=(15, 15), maxLevel=2,
+          criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
 
 
-def liveness_flow(gray, face_box):
-    """
-    Return mean optical flow magnitude in the face box (float, px/frame).
-
-    State (prev_gray, prev_pts) is stored in STATE and updated each call.
-    """
-    if face_box is None:
-        STATE["prev_gray"] = gray
-        STATE["prev_pts"] = None
+def liveness_flow(gray, box):
+    if box is None:
+        STATE["prev_gray"] = gray; STATE["prev_pts"] = None
         return 0.0
-
-    x1, y1, x2, y2 = [int(v) for v in face_box]
+    x1, y1, x2, y2 = [int(v) for v in box]
     h, w = gray.shape
     x1 = max(0, min(x1, w - 1)); x2 = max(0, min(x2, w - 1))
     y1 = max(0, min(y1, h - 1)); y2 = max(0, min(y2, h - 1))
-    if x2 - x1 < 20 or y2 - y1 < 20:
-        return 0.0
-
-    roi_mask = np.zeros_like(gray)
-    roi_mask[y1:y2, x1:x2] = 255
-
-    prev_gray = STATE["prev_gray"]
-    prev_pts = STATE["prev_pts"]
-
-    if prev_gray is None or prev_pts is None or len(prev_pts) < 5:
+    if x2 - x1 < 20 or y2 - y1 < 20: return 0.0
+    m = np.zeros_like(gray); m[y1:y2, x1:x2] = 255
+    pg, pp = STATE["prev_gray"], STATE["prev_pts"]
+    if pg is None or pp is None or len(pp) < 5:
         pts = cv2.goodFeaturesToTrack(gray, maxCorners=30,
                                       qualityLevel=0.01, minDistance=10,
-                                      mask=roi_mask)
-        STATE["prev_gray"] = gray
-        STATE["prev_pts"] = pts
+                                      mask=m)
+        STATE["prev_gray"] = gray; STATE["prev_pts"] = pts
         return 0.0
-
-    next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-        prev_gray, gray, prev_pts, None, **LK_PARAMS
-    )
+    np_, st, _ = cv2.calcOpticalFlowPyrLK(pg, gray, pp, None, **LK)
     STATE["prev_gray"] = gray
-
-    if next_pts is None or status is None:
-        STATE["prev_pts"] = None
-        return 0.0
-
-    good = status.ravel() == 1
+    if np_ is None or st is None:
+        STATE["prev_pts"] = None; return 0.0
+    good = st.ravel() == 1
     if good.sum() < 3:
-        STATE["prev_pts"] = next_pts
-        return 0.0
+        STATE["prev_pts"] = np_; return 0.0
+    f = float(np.linalg.norm(np_[good] - pp[good], axis=2).mean())
+    STATE["prev_pts"] = np_
+    return f
 
-    flow = np.linalg.norm(next_pts[good] - prev_pts[good], axis=2).mean()
-    STATE["prev_pts"] = next_pts
-    return float(flow)
+
+def analyze_face(gray_small):
+    box = STATE["face_box"]
+    res = {"face_box": box, "au": np.zeros(5, dtype=np.float32),
+           "mood": "neutral", "focus": 0.0, "motion": 0.0}
+    if box is None: return res
+    h, w = gray_small.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in box]
+    x1 = max(0, min(x1, w - 1)); x2 = max(0, min(x2, w - 1))
+    y1 = max(0, min(y1, h - 1)); y2 = max(0, min(y2, h - 1))
+    fh, fw = y2 - y1, x2 - x1
+    if fh < 60 or fw < 60: return res
+
+    brow_y0, brow_y1 = y1 + int(fh * 0.15), y1 + int(fh * 0.35)
+    eye_y0, eye_y1 = y1 + int(fh * 0.35), y1 + int(fh * 0.55)
+    mouth_y0, mouth_y1 = y1 + int(fh * 0.70), y1 + int(fh * 0.95)
+    mouth_x0, mouth_x1 = x1 + int(fw * 0.25), x1 + int(fw * 0.75)
+
+    brow_roi = gray_small[brow_y0:brow_y1, x1:x2]
+    eye_roi = gray_small[eye_y0:eye_y1, x1:x2]
+    mouth_roi = gray_small[mouth_y0:mouth_y1, mouth_x0:mouth_x1]
+
+    au12, au25, _ = mouth_au(gray_small, mouth_roi)
+    au6, _ = eye_au(gray_small, eye_roi)
+    au1, au4, _ = brow_au(gray_small, brow_roi)
+
+    raw = np.array([au12, au6, au4, au1, au25], dtype=np.float32)
+    if STATE["mood_kf"] is None:
+        STATE["mood_kf"] = init_kalman(5)
+    STATE["mood_kf"].correct(raw.reshape(-1, 1).astype(np.float32))
+    smooth = np.clip(STATE["mood_kf"].predict().ravel(), 0.0, 1.0)
+
+    motion = liveness_flow(gray_small, box) if STATE["show_liveness"] else 0.0
+    now = time.time()
+    if float(raw[1]) > 0.85:
+        last = STATE["blink_times"][-1] if STATE["blink_times"] else 0
+        if now - last > 0.20:
+            STATE["blink_times"].append(now)
+    br = sum(1 for t in STATE["blink_times"] if now - t < 60.0)
+    focus = float(np.clip(100.0 - min(1.5 * br, 40.0) - 60.0 * motion,
+                          0.0, 100.0))
+    res.update({"au": smooth, "mood": classify_mood(smooth),
+                "focus": focus, "motion": motion})
+    return res
 
 
 # ============================================================================
-# SECTION 11 — MOUSE CALLBACK, KEYBOARD, MAIN LOOP
+# OVERLAY — non-expert readable
 # ============================================================================
+MOOD_COLORS = {"happy": C_POS, "focused": C_BLUE, "surprised": C_AMBER,
+               "talking": C_PURPLE, "neutral": C_MUTED}
 
-def on_mouse(event, x, y, flags, param):
-    """Track the mouse position over the FocusGuard window."""
+MOOD_MEANING = {
+    "happy":     "smiling with cheeks raised",
+    "focused":   "brow lowered, concentrated look",
+    "surprised": "brows raised, mouth open",
+    "talking":   "mouth moving / open",
+    "neutral":   "no strong expression detected",
+}
+
+
+def _au_state(v):
+    """Return (label, color) for a raw AU activation value."""
+    if v > 0.60:  return "HIGH", C_POS
+    if v > 0.30:  return "MED",  C_AMBER
+    return "LOW", C_MUTED
+
+
+def draw_overlay(canvas, data, frame_rect, mouse_xy):
+    H, W = canvas.shape[:2]
+    fx, fy, fw, fh = frame_rect
+
+    # ---------- Header strip ----------
+    hh = 64
+    ov = canvas.copy()
+    cv2.rectangle(ov, (0, 0), (W, hh), (10, 10, 14), -1)
+    cv2.addWeighted(ov, 0.80, canvas, 0.20, 0, canvas)
+    cv2.putText(canvas, "FocusGuard", (24, 44), F_TITLE, 1.0,
+                C_TEXT, 2, cv2.LINE_AA)
+
+    mood_lbl = f"Mood: {data['mood']}"
+    mc = MOOD_COLORS.get(data["mood"], C_TEXT)
+    (tw, _), _ = cv2.getTextSize(mood_lbl, F_TITLE, 1.0, 2)
+    cv2.putText(canvas, mood_lbl, (W - tw - 24, 44), F_TITLE, 1.0,
+                mc, 2, cv2.LINE_AA)
+
+    # ---------- Face box ----------
+    if data["face_box"] is not None:
+        bx1, by1, bx2, by2 = [int(v) for v in data["face_box"]]
+        sx, sy = fw / WORK_W, fh / WORK_H
+        cv2.rectangle(canvas,
+                      (fx + int(bx1 * sx), fy + int(by1 * sy)),
+                      (fx + int(bx2 * sx), fy + int(by2 * sy)),
+                      C_GREEN, 3, cv2.LINE_AA)
+
+    # ---------- Cursor crosshair ----------
+    mx, my = mouse_xy
+    if 0 <= mx < W and 0 <= my < H:
+        cv2.drawMarker(canvas, (mx, my), C_YELLOW,
+                       cv2.MARKER_CROSS, 28, 3, cv2.LINE_AA)
+
+    # ---------- LEFT PANEL: what the detector is reading ----------
+    panel_x = 20
+    panel_y = hh + 20
+    panel_w = 380
+    panel_h = 300
+
+    ov = canvas.copy()
+    cv2.rectangle(ov, (panel_x, panel_y),
+                  (panel_x + panel_w, panel_y + panel_h), (12, 12, 18), -1)
+    cv2.addWeighted(ov, 0.82, canvas, 0.18, 0, canvas)
+    cv2.rectangle(canvas, (panel_x, panel_y),
+                  (panel_x + panel_w, panel_y + panel_h), C_BORDER, 2,
+                  cv2.LINE_AA)
+
+    # Section heading
+    cv2.putText(canvas, "FACIAL SIGNALS",
+                (panel_x + 16, panel_y + 30), F_TITLE, 0.68,
+                C_AMBER, 2, cv2.LINE_AA)
+    cv2.putText(canvas, "what the demo is reading on your face",
+                (panel_x + 16, panel_y + 54), F_BODY, 0.45,
+                C_MUTED, 1, cv2.LINE_AA)
+    cv2.line(canvas, (panel_x + 16, panel_y + 62),
+             (panel_x + panel_w - 16, panel_y + 62), C_BORDER, 1)
+
+    # AU rows
+    bar_x = panel_x + 150
+    bar_w = 150
+    bar_h = 14
+    row_y = panel_y + 80
+    row_gap = 42
+
+    for i, (short, plain, tech, hint_lo, hint_hi) in enumerate(AU_INFO):
+        v = float(data["au"][i])
+        state, scol = _au_state(v)
+        y = row_y + i * row_gap
+
+        # Colored dot indicator
+        cv2.circle(canvas, (panel_x + 24, y + 10), 6, scol, -1,
+                   cv2.LINE_AA)
+
+        # Friendly name
+        cv2.putText(canvas, short, (panel_x + 40, y + 16),
+                    F_TITLE, 0.62, C_TEXT, 2, cv2.LINE_AA)
+
+        # Bar
+        cv2.rectangle(canvas, (bar_x, y + 2),
+                      (bar_x + bar_w, y + 2 + bar_h), (40, 40, 52), -1)
+        fill = int(bar_w * np.clip(v, 0, 1))
+        cv2.rectangle(canvas, (bar_x, y + 2),
+                      (bar_x + fill, y + 2 + bar_h), scol, -1)
+
+        # State label + value
+        cv2.putText(canvas, state, (bar_x + bar_w + 10, y + 14),
+                    F_BODY, 0.52, scol, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"{v:.2f}",
+                    (bar_x + bar_w + 10, y + 30),
+                    F_BODY, 0.42, C_MUTED, 1, cv2.LINE_AA)
+
+        # Technical annotation (subtle, under the row)
+        cv2.putText(canvas, f"{plain}  ({tech})",
+                    (panel_x + 40, y + 32),
+                    F_BODY, 0.40, C_MUTED, 1, cv2.LINE_AA)
+
+    # ---------- RIGHT PANEL: focus score + mood explanation ----------
+    card_w = 280
+    card_h = 190
+    cx = W - card_w - 20
+    cy = hh + 20
+
+    ov = canvas.copy()
+    cv2.rectangle(ov, (cx, cy), (cx + card_w, cy + card_h),
+                  (12, 12, 18), -1)
+    cv2.addWeighted(ov, 0.82, canvas, 0.18, 0, canvas)
+    cv2.rectangle(canvas, (cx, cy), (cx + card_w, cy + card_h),
+                  C_BORDER, 2, cv2.LINE_AA)
+
+    cv2.putText(canvas, "FOCUS SCORE", (cx + 16, cy + 30),
+                F_TITLE, 0.62, C_AMBER, 2, cv2.LINE_AA)
+    cv2.putText(canvas, "(how engaged you look)", (cx + 16, cy + 50),
+                F_BODY, 0.42, C_MUTED, 1, cv2.LINE_AA)
+
+    fs = int(data["focus"])
+    fcol = C_GREEN if fs > 65 else (C_AMBER if fs > 35 else C_RED)
+    # Big number — right aligned
+    big = str(fs)
+    (bw, bh), _ = cv2.getTextSize(big, F_TITLE, 2.2, 3)
+    cv2.putText(canvas, big, (cx + card_w - bw - 16, cy + 120),
+                F_TITLE, 2.2, fcol, 3, cv2.LINE_AA)
+
+    # Focus bar
+    bar_x2 = cx + 16
+    bar_y2 = cy + 138
+    bar_w2 = card_w - 32
+    cv2.rectangle(canvas, (bar_x2, bar_y2),
+                  (bar_x2 + bar_w2, bar_y2 + 12), (40, 40, 52), -1)
+    cv2.rectangle(canvas, (bar_x2, bar_y2),
+                  (bar_x2 + int(bar_w2 * fs / 100), bar_y2 + 12), fcol, -1)
+    cv2.putText(canvas, "0", (bar_x2, bar_y2 + 30),
+                F_BODY, 0.35, C_MUTED, 1, cv2.LINE_AA)
+    cv2.putText(canvas, "100", (bar_x2 + bar_w2 - 24, bar_y2 + 30),
+                F_BODY, 0.35, C_MUTED, 1, cv2.LINE_AA)
+
+    # ---------- Bottom strip: mood explanation ----------
+    strip_h = 56
+    sy = H - strip_h
+    ov = canvas.copy()
+    cv2.rectangle(ov, (0, sy), (W, H), (10, 10, 14), -1)
+    cv2.addWeighted(ov, 0.80, canvas, 0.20, 0, canvas)
+    cv2.line(canvas, (0, sy), (W, sy), C_BORDER, 1)
+
+    why = MOOD_MEANING.get(data["mood"], "")
+    cv2.putText(canvas, "Why this mood?",
+                (20, sy + 24), F_TITLE, 0.55, C_AMBER, 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"'{data['mood']}' = {why}",
+                (20, sy + 46), F_BODY, 0.55, C_TEXT, 1, cv2.LINE_AA)
+
+    # Liveness indicator (bottom-right)
+    if STATE["show_liveness"]:
+        live = "LIVE PERSON" if data["motion"] > 0.15 else "STILL (spoof?)"
+        lc = C_GREEN if data["motion"] > 0.15 else C_RED
+        (lw, _), _ = cv2.getTextSize(live, F_TITLE, 0.62, 2)
+        cv2.putText(canvas, live, (W - lw - 20, sy + 30),
+                    F_TITLE, 0.62, lc, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"motion={data['motion']:.2f} px/frame",
+                    (W - 220, sy + 48), F_BODY, 0.45, C_MUTED, 1,
+                    cv2.LINE_AA)
+
+
+# ============================================================================
+# WINDOW SETUP
+# ============================================================================
+def get_screen():
+    try:
+        import tkinter as tk
+        r = tk.Tk(); r.withdraw()
+        w, h = r.winfo_screenwidth(), r.winfo_screenheight()
+        r.destroy()
+        return w, h
+    except Exception:
+        return 1920, 1080
+
+
+def compute_layout(sw, sh):
+    M, G, T, B = 20, 20, 20, 60
+    aw, ah = sw - 2 * M - G, sh - T - B
+    vert = sw < 1200
+    if vert:
+        mw = aw + G; a_w = mw; mh = int(ah * 0.45); a_h = ah - mh - G
+        return {"vertical": True, "margin": M, "gutter": G, "top": T,
+                "main": (M, T, mw, mh), "math": (M, T + mh + G, a_w, a_h)}
+    mw = int(aw * 0.40); a_w = aw - mw; mh = ah; a_h = ah
+    return {"vertical": False, "margin": M, "gutter": G, "top": T,
+            "main": (M, T, mw, mh),
+            "math": (M + mw + G, T, a_w, a_h)}
+
+
+def fit_frame(frame, rw, rh):
+    fh, fw = frame.shape[:2]
+    s = min(rw / fw, rh / fh)
+    nw, nh = int(fw * s), int(fh * s)
+    return (cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR),
+            (rw - nw) // 2, (rh - nh) // 2, nw, nh)
+
+
+# ============================================================================
+# MATH PANEL DISPATCH
+# ============================================================================
+def math_signature():
+    return (STATE["panel"], STATE["kernel_idx"], STATE["se_idx"],
+            STATE["op_idx"], STATE["mouse_small_x"], STATE["mouse_small_y"])
+
+
+def get_math_panel(gray_small, fc, cw, ch):
+    sig = math_signature()
+    if STATE["math_sig"] == sig and STATE["math_cache"] is not None:
+        return STATE["math_cache"]
+    p = STATE["panel"]
+    x, y = STATE["mouse_small_x"], STATE["mouse_small_y"]
+    if p == "kernel":
+        c = render_kernel_panel(gray_small, x, y,
+                                KERNEL_ORDER[STATE["kernel_idx"]], cw, ch)
+    elif p == "morph":
+        c = render_morph_panel(gray_small, x, y,
+                               SE_ORDER[STATE["se_idx"]],
+                               MORPH_OPS[STATE["op_idx"]], cw, ch)
+    elif p == "otsu":
+        if STATE["otsu_cache"] is None or fc % MATH_REDRAW_EVERY == 0:
+            STATE["otsu_cache"] = render_otsu_panel(gray_small, cw, ch)
+        c = STATE["otsu_cache"]
+    elif p == "hough":
+        if STATE["hough_cache"] is None or fc % MATH_REDRAW_EVERY == 0:
+            edges = cv2.Canny(gray_small, 50, 150)
+            STATE["hough_cache"] = render_hough_panel(edges, cw, ch)
+        c = STATE["hough_cache"]
+    else:
+        c = blank_canvas(cw, ch)
+    STATE["math_cache"] = c
+    STATE["math_sig"] = sig
+    return c
+
+
+# ============================================================================
+# INTERACTION
+# ============================================================================
+def on_mouse(event, x, y, flags, _):
     if event == cv2.EVENT_MOUSEMOVE:
         STATE["mouse"] = (x, y)
 
 
-def draw_mood_overlay(frame, data):
-    """Draw AU bars, mood label, focus score, liveness onto the frame."""
-    h, w = frame.shape[:2]
-
-    # AU bars (top-left)
-    au_names = ["AU12", "AU6", "AU4", "AU1", "AU25"]
-    au_values = data["au"]
-    bar_x0, bar_y0 = 12, 12
-    bar_max = 160
-    for i, (name, val) in enumerate(zip(au_names, au_values)):
-        y0 = bar_y0 + i * 22
-        y1 = y0 + 16
-        # background bar
-        cv2.rectangle(frame, (bar_x0, y0), (bar_x0 + bar_max, y1),
-                      (40, 40, 52), -1)
-        # filled bar
-        fill_w = int(bar_max * float(val))
-        cv2.rectangle(frame, (bar_x0, y0), (bar_x0 + fill_w, y1),
-                      (180, 200, 80), -1)
-        cv2.putText(frame, name, (bar_x0 + bar_max + 8, y1 - 2),
-                    FONT, 0.42, C_TEXT, 1, cv2.LINE_AA)
-
-    # Mood + focus (top-right)
-    mood_text = f"Mood: {data['mood']}"
-    focus_text = f"Focus: {data['focus']:.0f}"
-    (tw1, _), _ = cv2.getTextSize(mood_text, FONT, 0.7, 2)
-    (tw2, _), _ = cv2.getTextSize(focus_text, FONT, 0.7, 2)
-    x_mood = w - tw1 - 16
-    x_focus = w - tw2 - 16
-    cv2.putText(frame, mood_text, (x_mood, 34), FONT, 0.7,
-                (80, 220, 240), 2, cv2.LINE_AA)
-    cv2.putText(frame, focus_text, (x_focus, 64), FONT, 0.7,
-                (240, 200, 80), 2, cv2.LINE_AA)
-
-    # Focus bar
-    fb_w = 220
-    fb_x0 = w - fb_w - 16
-    fb_y0 = 78
-    cv2.rectangle(frame, (fb_x0, fb_y0), (fb_x0 + fb_w, fb_y0 + 10),
-                  (40, 40, 52), -1)
-    fill_w = int(fb_w * float(data["focus"]) / 100.0)
-    bar_color = (0, 220, 0) if data["focus"] > 60 else \
-                (0, 200, 220) if data["focus"] > 30 else (0, 0, 240)
-    cv2.rectangle(frame, (fb_x0, fb_y0), (fb_x0 + fill_w, fb_y0 + 10),
-                  bar_color, -1)
-
-    # Liveness (bottom-right)
-    if STATE["show_liveness"]:
-        live = "REAL" if data["motion"] > 0.15 else "SPOOF?"
-        color = (0, 220, 0) if live == "REAL" else (0, 0, 240)
-        cv2.putText(frame, live, (w - 120, h - 20), FONT, 0.8,
-                    color, 2, cv2.LINE_AA)
-        cv2.putText(frame, f"flow={data['motion']:.2f}",
-                    (w - 120, h - 46), FONT, 0.45, C_TEXT, 1, cv2.LINE_AA)
-
-    # Face box
-    if data["face_box"] is not None:
-        x1, y1, x2, y2 = data["face_box"]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 220, 80), 2)
-
-    # Cursor crosshair (from mouse position)
-    mx, my = STATE["mouse"]
-    if 0 <= mx < w and 0 <= my < h:
-        cv2.drawMarker(frame, (mx, my), C_YELLOW,
-                       cv2.MARKER_CROSS, 24, 2, cv2.LINE_AA)
-
-
-def draw_cursor_box(frame, gray_shape, kernel_size):
-    """Draw the k x k neighborhood box around the cursor in the display."""
-    mx, my = STATE["mouse"]
-    h_frame, w_frame = frame.shape[:2]
-    h_gray, w_gray = gray_shape[:2]
-    sx = w_frame / max(w_gray, 1)
-    sy = h_frame / max(h_gray, 1)
-    r_x = int(kernel_size * sx / 2)
-    r_y = int(kernel_size * sy / 2)
-    cv2.rectangle(frame, (mx - r_x, my - r_y), (mx + r_x, my + r_y),
-                  C_GREEN, 1)
-
-
-def analyze_face(frame_small, gray_small):
-    """Run the full mood/focus/liveness pipeline for one frame."""
-    # --- face detect (uses cached box between detect frames) ---
-    box = STATE["face_box"]
-    if box is None:
-        box = None
-
-    result = {
-        "face_box": box,
-        "au": np.zeros(5, dtype=np.float32),
-        "mood": "neutral",
-        "focus": 0.0,
-        "motion": 0.0,
-        "mouth_mask": None,
-        "eye_mask": None,
-        "brow_edges": None,
-    }
-
-    if box is None:
-        return result
-
-    x1, y1, x2, y2 = [int(v) for v in box]
-    h_s, w_s = gray_small.shape[:2]
-    x1 = max(0, min(x1, w_s - 1)); x2 = max(0, min(x2, w_s - 1))
-    y1 = max(0, min(y1, h_s - 1)); y2 = max(0, min(y2, h_s - 1))
-    fh = y2 - y1
-    fw = x2 - x1
-    if fh < 40 or fw < 40:
-        return result
-
-    # ROI split: brow (top 1/4), eye (next 1/4), mouth (bottom 2/5)
-    brow_roi = gray_small[y1:y1 + fh // 4, x1:x2]
-    eye_roi = gray_small[y1 + fh // 5:y1 + 2 * fh // 5, x1:x2]
-    mouth_y0 = y1 + int(fh * 0.6)
-    mouth_roi = gray_small[mouth_y0:y2, x1:x2]
-    mouth_roi_bgr = frame_small[mouth_y0:y2, x1:x2]
-
-    # --- mouth: Otsu + morphology + contour ---
-    au12, au25, mouth_mask, _, _ = mouth_au(gray_small, mouth_roi,
-                                             mouth_roi_bgr)
-    # --- eye: adaptive threshold ---
-    au6, eye_mask = eye_au(gray_small, eye_roi)
-    # --- brow: Canny + Hough ---
-    au1, au4, brow_edges, _ = brow_au(gray_small, brow_roi)
-
-    au_raw = np.array([au12, au6, au4, au1, au25], dtype=np.float32)
-
-    # --- Kalman smoothing ---
-    if STATE["mood_kf"] is None:
-        STATE["mood_kf"] = init_kalman_mood(5)
-    STATE["mood_kf"].correct(au_raw.reshape(-1, 1).astype(np.float32))
-    au_smooth = STATE["mood_kf"].predict().ravel()
-    au_smooth = np.clip(au_smooth, 0.0, 1.0)
-
-    # --- liveness ---
-    motion = liveness_flow(gray_small, box) if STATE["show_liveness"] else 0.0
-
-    # --- focus score ---
-    now = time.time()
-    au_eye = au_smooth[1]  # AU6 proxy
-    # crude blink detection: eye "closed" when AU6 (squint proxy) > 0.6
-    if au_eye > 0.6:
-        # record a blink once per event (debounced by 0.25s)
-        last = STATE["blink_times"][-1] if STATE["blink_times"] else 0
-        if now - last > 0.25:
-            STATE["blink_times"].append(now)
-    blink_rate = sum(1 for t in STATE["blink_times"] if now - t < 60.0)
-    focus = float(np.clip(100.0 - 1.5 * blink_rate - 100.0 * motion,
-                          0.0, 100.0))
-
-    result.update({
-        "au": au_smooth,
-        "mood": classify_mood(au_smooth),
-        "focus": focus,
-        "motion": motion,
-        "mouth_mask": mouth_mask,
-        "eye_mask": eye_mask,
-        "brow_edges": brow_edges,
-    })
-    return result
-
-
-def render_math_panel(gray_small, frame_count):
-    """
-    Dispatch to the active panel renderer and return the canvas to display.
-    Cached matplotlib panels (Otsu, Hough) are redrawn every N frames.
-    """
-    panel = STATE["panel"]
-
-    if panel == "kernel":
-        # Map mouse coords from display size to work size
-        kernel_name = KERNEL_ORDER[STATE["kernel_idx"]]
-        mx, my = STATE["mouse"]
-        # Use the current mouse position directly in the small image space
-        # (the mouse callback records display coords; scale down here)
-        # Note: the caller passes mouse in small coords via STATE["mouse_small"]
-        x_s = STATE.get("mouse_small_x", mx)
-        y_s = STATE.get("mouse_small_y", my)
-        return render_kernel_panel(gray_small, int(x_s), int(y_s),
-                                   kernel_name)
-
-    if panel == "morph":
-        se_name = SE_ORDER[STATE["se_idx"]]
-        op = MORPH_OPS[STATE["op_idx"]]
-        x_s = STATE.get("mouse_small_x", 0)
-        y_s = STATE.get("mouse_small_y", 0)
-        return render_morph_panel(gray_small, int(x_s), int(y_s),
-                                  se_name, op)
-
-    if panel == "otsu":
-        if STATE["otsu_cache"] is None or \
-                frame_count % MATH_REDRAW_EVERY == 0:
-            STATE["otsu_cache"] = render_otsu_panel(gray_small)
-        return STATE["otsu_cache"]
-
-    if panel == "hough":
-        if STATE["hough_cache"] is None or \
-                frame_count % MATH_REDRAW_EVERY == 0:
-            edges = cv2.Canny(gray_small, 50, 150)
-            STATE["hough_cache"] = render_hough_panel(edges)
-        return STATE["hough_cache"]
-
-    return blank_canvas(MATH_W, MATH_H)
-
-
-def print_banner():
-    print("=" * 62)
-    print(" FocusGuard running.")
-    print(" Controls:")
-    print("   1 / 2 / 3 / 4   Switch math panel")
-    print("   k               Cycle kernel")
-    print("   m               Cycle structuring element")
-    print("   o               Toggle dilate <-> erode")
-    print("   l               Toggle LAB <-> DEMO")
-    print("   s               Toggle liveness detection")
-    print("   q               Quit (runs session report)")
-    print(" Press the VS Code Stop button (square icon) if 'q' fails.")
-    print("=" * 62)
-
-
-def handle_key(key):
-    """Return True to continue, False to quit."""
-    if key == 255 or key == -1:
-        return True
-    if key == ord("q"):
-        return False
-    if key == ord("1"): STATE["panel"] = "kernel"
-    elif key == ord("2"): STATE["panel"] = "morph"
-    elif key == ord("3"): STATE["panel"] = "otsu"
-    elif key == ord("4"): STATE["panel"] = "hough"
-    elif key == ord("k"):
+def handle_key(k):
+    if k in (255, -1): return True
+    if k == ord("q"): return False
+    if k == ord("1"): STATE["panel"] = "kernel"
+    elif k == ord("2"): STATE["panel"] = "morph"
+    elif k == ord("3"): STATE["panel"] = "otsu"
+    elif k == ord("4"): STATE["panel"] = "hough"
+    elif k == ord("k"):
         STATE["kernel_idx"] = (STATE["kernel_idx"] + 1) % len(KERNEL_ORDER)
-    elif key == ord("m"):
+    elif k == ord("m"):
         STATE["se_idx"] = (STATE["se_idx"] + 1) % len(SE_ORDER)
-    elif key == ord("o"):
+    elif k == ord("o"):
         STATE["op_idx"] = (STATE["op_idx"] + 1) % len(MORPH_OPS)
-    elif key == ord("l"):
+    elif k == ord("l"):
         STATE["mode"] = "DEMO" if STATE["mode"] == "LAB" else "LAB"
-    elif key == ord("s"):
+    elif k == ord("s"):
         STATE["show_liveness"] = not STATE["show_liveness"]
+    STATE["math_sig"] = None
     return True
 
 
+# ============================================================================
+# MAIN
+# ============================================================================
 def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    kind, detector = load_face_detector(script_dir)
+    here = os.path.dirname(os.path.abspath(__file__))
+    kind, detector = load_face_detector(here)
 
     cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
-        print(f"[focusguard] ERROR: cannot open camera {CAM_INDEX}")
+        print(f"[focusguard] cannot open camera {CAM_INDEX}")
         return
+
+    sw, sh = get_screen()
+    L = compute_layout(sw, sh)
+    mx_, my_, mw_, mh_ = L["main"]
+    ax_, ay_, aw_, ah_ = L["math"]
+    print(f"[focusguard] Screen: {sw}x{sh} "
+          f"({'vertical' if L['vertical'] else 'horizontal'})")
+    print(f"[focusguard] FocusGuard: {mw_}x{mh_} at ({mx_}, {my_})")
+    print(f"[focusguard] Math Panel: {aw_}x{ah_} at ({ax_}, {ay_})")
 
     cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
     cv2.namedWindow(WINDOW_MATH, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_MAIN, mw_, mh_)
+    cv2.resizeWindow(WINDOW_MATH, aw_, ah_)
+    cv2.moveWindow(WINDOW_MAIN, mx_, my_)
+    cv2.moveWindow(WINDOW_MATH, ax_, ay_)
+    cv2.waitKey(1); cv2.waitKey(1)
     cv2.setMouseCallback(WINDOW_MAIN, on_mouse)
+    if shutil.which("wmctrl"):
+        for w in (WINDOW_MAIN, WINDOW_MATH):
+            try:
+                subprocess.Popen(["wmctrl", "-r", w, "-b", "add,above"],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except Exception: pass
 
     STATE["start_time"] = time.time()
-    print_banner()
+    print("=" * 64)
+    print(" FocusGuard running.  1/2/3/4 panel | k kernel | m SE")
+    print(" o dil/ero | l LAB/DEMO | s liveness | q quit")
+    print("=" * 64)
 
     try:
         while True:
             ok, frame = cap.read()
-            if not ok:
-                print("[focusguard] camera read failed; exiting loop")
-                break
-
-            # Mirror for natural interaction
+            if not ok: break
             frame = cv2.flip(frame, 1)
-            h_full, w_full = frame.shape[:2]
-
-            # Downscale for CV work
             small = cv2.resize(frame, (WORK_W, WORK_H),
                                interpolation=cv2.INTER_AREA)
             gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-
             STATE["frame_count"] += 1
             fc = STATE["frame_count"]
 
-            # Map mouse coords from display to small
-            mx_disp, my_disp = STATE["mouse"]
-            mx_small = int(mx_disp * WORK_W / max(w_full, 1))
-            my_small = int(my_disp * WORK_H / max(h_full, 1))
-            mx_small = int(np.clip(mx_small, 0, WORK_W - 1))
-            my_small = int(np.clip(my_small, 0, WORK_H - 1))
-            STATE["mouse_small_x"] = mx_small
-            STATE["mouse_small_y"] = my_small
+            mxd, myd = STATE["mouse"]
+            STATE["mouse_small_x"] = int(np.clip(
+                mxd * WORK_W / max(mw_, 1), 0, WORK_W - 1))
+            STATE["mouse_small_y"] = int(np.clip(
+                myd * WORK_H / max(mh_, 1), 0, WORK_H - 1))
 
-            # Face detect every N frames
             if fc % DETECT_EVERY == 0:
                 if kind == "dnn":
-                    box = detect_face_dnn(detector, small)
+                    STATE["face_box"] = detect_face_dnn(detector, small)
                 elif kind == "haar":
-                    box = detect_face_haar(detector, gray_small)
-                else:
-                    box = None
-                # Scale box back up to full frame for overlay drawing
-                if box is not None:
-                    sx = w_full / WORK_W
-                    sy = h_full / WORK_H
-                    STATE["face_box"] = np.array([
-                        int(box[0] * sx), int(box[1] * sy),
-                        int(box[2] * sx), int(box[3] * sy),
-                    ], dtype=int)
+                    STATE["face_box"] = detect_face_haar(detector, gray_small)
                 else:
                     STATE["face_box"] = None
 
-            # Analyze face using the SMALL frame (fast), but pass the
-            # full-size frame for the box (drawn by overlay)
-            small_box = None
-            if STATE["face_box"] is not None:
-                sx = WORK_W / w_full
-                sy = WORK_H / h_full
-                b = STATE["face_box"]
-                small_box = np.array([
-                    int(b[0] * sx), int(b[1] * sy),
-                    int(b[2] * sx), int(b[3] * sy),
-                ], dtype=int)
-            STATE["face_box"] = STATE["face_box"]  # keep full-size for draw
-            _saved = STATE["face_box"]
-            # Temporarily swap in small box for analysis
-            STATE["face_box"] = small_box
-            mood_data = analyze_face(small, gray_small)
-            STATE["face_box"] = _saved
-            mood_data["face_box"] = _saved
+            mood = analyze_face(gray_small)
 
-            # Draw overlay on full-size frame
-            disp = frame.copy()
-            draw_mood_overlay(disp, mood_data)
+            # FocusGuard canvas — draw the frame, then overlay on top
+            canvas = blank_canvas(mw_, mh_)
+            fitted, xo, yo, fw_, fh_ = fit_frame(frame, mw_, mh_ - 64)
+            canvas[64 + yo:64 + yo + fh_, xo:xo + fw_] = fitted
+            fr = (xo, 64 + yo, fw_, fh_)
 
-            # Neighborhood box around cursor
-            if STATE["panel"] == "kernel":
-                ksize = KERNELS[KERNEL_ORDER[STATE["kernel_idx"]]].shape[0]
-                draw_cursor_box(disp, gray_small.shape, ksize)
-            elif STATE["panel"] == "morph":
-                ksize = SE_KERNELS[SE_ORDER[STATE["se_idx"]]].shape[0]
-                draw_cursor_box(disp, gray_small.shape, ksize)
+            # face_box stays in SMALL coords — draw_overlay scales it
+            # exactly once.
+            draw_overlay(canvas, mood, fr, STATE["mouse"])
 
-            # Math panel
-            math_canvas = render_math_panel(gray_small, fc)
-            math_display = resize_panel(math_canvas, MATH_W, MATH_H)
+            math = get_math_panel(gray_small, fc, aw_, ah_)
 
-            # Mode banner (top of math panel)
-            banner = f"{STATE['mode']} MODE"
-            if STATE["mode"] == "DEMO" and _saved is not None:
-                banner += "  —  tracking face ROI"
-            banner_color = C_RED if STATE["mode"] == "DEMO" else C_GREEN
-            cv2.rectangle(math_display, (0, 0), (MATH_W, 22),
-                          (12, 12, 18), -1)
-            cv2.putText(math_display, banner, (10, 16), FONT, 0.5,
-                        banner_color, 1, cv2.LINE_AA)
-            # Panel label (right side of banner)
-            label = f"Panel: {STATE['panel']}"
-            (lw, _), _ = cv2.getTextSize(label, FONT, 0.5, 1)
-            cv2.putText(math_display, label, (MATH_W - lw - 10, 16),
-                        FONT, 0.5, C_TEXT, 1, cv2.LINE_AA)
+            cv2.imshow(WINDOW_MAIN, canvas)
+            cv2.imshow(WINDOW_MATH, math)
 
-            cv2.imshow(WINDOW_MAIN, disp)
-            cv2.imshow(WINDOW_MATH, math_display)
-
-            # Log focus for the session report
             if STATE["start_time"] is not None:
                 t = time.time() - STATE["start_time"]
-                STATE["focus_log"].append((t, mood_data["focus"]))
+                STATE["focus_log"].append((t, mood["focus"]))
 
-            # Keyboard
-            key = cv2.waitKey(1) & 0xFF
-            if not handle_key(key):
-                break
-
-            # Window-closed detection
+            k = cv2.waitKey(1) & 0xFF
+            if not handle_key(k): break
             if cv2.getWindowProperty(WINDOW_MAIN, cv2.WND_PROP_VISIBLE) < 1:
                 break
             if cv2.getWindowProperty(WINDOW_MATH, cv2.WND_PROP_VISIBLE) < 1:
                 break
-
     except KeyboardInterrupt:
-        print("[focusguard] Interrupted by user.")
+        print("[focusguard] Interrupted.")
     finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        print("[focusguard] Camera released. Windows closed.")
+        cap.release(); cv2.destroyAllWindows()
+        print("[focusguard] Released.")
 
 
 # ============================================================================
-# SECTION 12 — SESSION REPORT
+# SESSION REPORT
 # ============================================================================
-# When the user quits with 'q', produce a summary PNG showing the focus
-# timeline. Saved next to the script as session_report.png.
-# ----------------------------------------------------------------------------
-
-def session_report(output_path="session_report.png"):
+def session_report(path="session_report.png"):
     log = STATE["focus_log"]
     if not log:
-        print("[focusguard] No session data to report.")
-        return None
-
-    times = [t for (t, _) in log]
-    scores = [s for (_, s) in log]
-
+        print("[focusguard] no session data"); return None
+    t = [a for a, _ in log]; s = [b for _, b in log]
     fig = plt.figure(figsize=(11, 3.5), dpi=110, facecolor="#121218")
-    ax = fig.add_subplot(1, 1, 1)
-    ax.set_facecolor("#1a1a24")
-    ax.plot(times, scores, color="#a3e635", linewidth=2)
-    ax.fill_between(times, scores, alpha=0.15, color="#a3e635")
+    ax = fig.add_subplot(1, 1, 1); ax.set_facecolor("#1a1a24")
+    ax.plot(t, s, color="#7dffa0", linewidth=2)
+    ax.fill_between(t, s, alpha=0.15, color="#7dffa0")
     ax.set_xlabel("session time (s)", color="#c8c8d8")
     ax.set_ylabel("focus score", color="#c8c8d8")
-    avg = float(np.mean(scores)) if scores else 0.0
-    ax.set_title(f"FocusGuard session — avg focus = {avg:.1f}",
-                 color="#e6e6f0", fontsize=12)
+    ax.set_title(f"avg focus = {float(np.mean(s)):.1f}",
+                 color="#e8e8f0", fontsize=12)
     ax.tick_params(colors="#c8c8d8")
     ax.grid(True, alpha=0.15, color="#5a5a6e")
-    for s in ax.spines.values():
-        s.set_color("#5a5a6e")
-    ax.set_ylim(0, 100)
+    for sp in ax.spines.values(): sp.set_color("#5a5a6e")
+    ax.set_ylim(0, 100); fig.tight_layout()
+    fig.savefig(path, facecolor="#121218"); plt.close(fig)
+    print(f"[focusguard] report -> {path}")
 
-    fig.tight_layout()
-    fig.savefig(output_path, facecolor="#121218")
-    plt.close(fig)
-    print(f"[focusguard] Session report saved to {output_path}")
-    return output_path
-
-
-# ============================================================================
-# SECTION 13 — ENTRY POINT
-# ============================================================================
-# Note: this block is what makes `python focusguard.py` work standalone.
-# When the notebook does `%run focusguard.py`, this block runs too — same
-# behavior.
-# ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     try:
